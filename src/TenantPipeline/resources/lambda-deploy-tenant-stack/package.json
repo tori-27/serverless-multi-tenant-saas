@@ -1,0 +1,21 @@
+{
+  "name": "lambda-deploy-tenant-stack",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "build": "esbuild index.ts --bundle --platform=node --target=node20 --outfile=index.js --external:@aws-sdk/*"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.20.0",
+    "typescript": "~5.4.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cloudformation": "^3.600.0",
+    "@aws-sdk/client-codepipeline": "^3.600.0",
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-s3": "^3.600.0",
+    "adm-zip": "^0.5.16"
+  }
+}

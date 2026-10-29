@@ -1,0 +1,1153 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  diplom-sam-app — Orders, Products, TenantManagement (TS)
+
+Globals:
+  Function:
+    Timeout: 10
+    Runtime: nodejs22.x
+    Tracing: Active
+    LoggingConfig: { LogFormat: JSON }
+  Api:
+    TracingEnabled: true
+    Cors:
+      AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+      AllowHeaders: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+      AllowOrigin: "'*'"
+    Auth:
+      DefaultAuthorizer: TenantLambdaAuthorizer
+      ApiKeyRequired: true
+      Authorizers:
+        TenantLambdaAuthorizer:
+          FunctionArn: !GetAtt AuthorizerFunction.Arn
+          FunctionPayloadType: TOKEN
+          Identity:
+            Header: Authorization
+            ValidationExpression: "^Bearer .+$"
+            ReauthorizeEvery: 300
+
+Parameters:
+  PlatinumTierApiKey:
+    Type: String
+    NoEcho: true
+  PremiumTierApiKey:
+    Type: String
+    NoEcho: true
+  StandardTierApiKey:
+    Type: String
+    NoEcho: true
+  BasicTierApiKey:
+    Type: String
+    NoEcho: true
+  SystemAdminApiKey:
+    Type: String
+    NoEcho: true
+
+Resources:
+  ########################
+  # DynamoDB (orders/products)
+  ########################
+  OrderTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: OrderTable
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: shardId, AttributeType: S }
+        - { AttributeName: orderId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: shardId, KeyType: HASH }
+        - { AttributeName: orderId, KeyType: RANGE }
+
+  ProductTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ProductTable
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: shardId, AttributeType: S }
+        - { AttributeName: productId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: shardId, KeyType: HASH }
+        - { AttributeName: productId, KeyType: RANGE }
+
+  ########################
+  # DynamoDB (tenant mgmt)
+  ########################
+  SettingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ServerlessSaaS-Settings
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: settingName, AttributeType: S }
+      KeySchema:
+        - { AttributeName: settingName, KeyType: HASH }
+
+  TenantDetailsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ServerlessSaaS-TenantDetails
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: tenantId, AttributeType: S }
+        - { AttributeName: tenantName, AttributeType: S }
+      KeySchema:
+        - { AttributeName: tenantId, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: ServerlessSaas-TenantConfig
+          KeySchema:
+            - { AttributeName: tenantName, KeyType: HASH }
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes: [userPoolId, appClientId, apiGatewayUrl]
+
+  TenantUserMappingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ServerlessSaaS-TenantUserMapping
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: tenantId, AttributeType: S }
+        - { AttributeName: userName, AttributeType: S }
+      KeySchema:
+        - { AttributeName: tenantId, KeyType: HASH }
+        - { AttributeName: userName, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: UserName
+          KeySchema:
+            - { AttributeName: userName, KeyType: HASH }
+            - { AttributeName: tenantId, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+
+  TenantStackMappingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: TenantStackMapping
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tenantId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenantId
+          KeyType: HASH
+
+  ########################
+  # Cognito (pooled tenant)
+  ########################
+  PooledUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: PooledTenant-ServerlessSaaSUserPool
+      AutoVerifiedAttributes: [email]
+      Schema:
+        - {
+            Name: email,
+            AttributeDataType: String,
+            Required: true,
+            Mutable: true,
+          }
+        - { Name: tenantId, AttributeDataType: String, Mutable: true }
+        - { Name: userRole, AttributeDataType: String, Mutable: true }
+
+  PooledUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: ServerlessSaaSClient
+      GenerateSecret: false
+      UserPoolId: !Ref PooledUserPool
+      AllowedOAuthFlowsUserPoolClient: false
+
+  ########################
+  # Orders — Lambdas & API
+  ########################
+  GetOrder:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/OrderService
+      Handler: handlers.getOrderHandler
+      Events:
+        {
+          ApiGet:
+            { Type: Api, Properties: { Path: "/order/{id}", Method: get } },
+        }
+      Environment: { Variables: { ORDER_TABLE_NAME: !Ref OrderTable } }
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref OrderTable }
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [handlers.ts],
+          },
+      }
+
+  DeleteOrder:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/OrderService
+      Handler: handlers.deleteOrderHandler
+      Events:
+        {
+          ApiDel:
+            { Type: Api, Properties: { Path: "/order/{id}", Method: delete } },
+        }
+      Environment: { Variables: { ORDER_TABLE_NAME: !Ref OrderTable } }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref OrderTable }
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [handlers.ts],
+          },
+      }
+
+  UpdateOrder:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/OrderService
+      Handler: handlers.updateOrderHandler
+      Events:
+        {
+          ApiPut:
+            { Type: Api, Properties: { Path: "/order/{id}", Method: put } },
+        }
+      Environment: { Variables: { ORDER_TABLE_NAME: !Ref OrderTable } }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref OrderTable }
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [handlers.ts],
+          },
+      }
+
+  CreateOrder:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/OrderService
+      Handler: handlers.createOrderHandler
+      Events:
+        { ApiPost: { Type: Api, Properties: { Path: /order, Method: post } } }
+      Environment: { Variables: { ORDER_TABLE_NAME: !Ref OrderTable } }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref OrderTable }
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [handlers.ts],
+          },
+      }
+
+  GetAllOrders:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/OrderService
+      Handler: handlers.getAllOrdersHandler
+      Events:
+        { ApiGetAll: { Type: Api, Properties: { Path: /orders, Method: get } } }
+      Environment: { Variables: { ORDER_TABLE_NAME: !Ref OrderTable } }
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref OrderTable }
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [handlers.ts],
+          },
+      }
+
+  ########################
+  # Products — Lambdas & API
+  ########################
+  GetProduct:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/ProductService
+      Handler: handlers.getProductHandler
+      Events:
+        {
+          ApiGet:
+            { Type: Api, Properties: { Path: "/product/{id}", Method: get } },
+        }
+      Environment: { Variables: { PRODUCT_TABLE_NAME: !Ref ProductTable } }
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref ProductTable }
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [handlers.ts],
+          },
+      }
+
+  DeleteProduct:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/ProductService
+      Handler: handlers.deleteProductHandler
+      Events:
+        {
+          ApiDel:
+            {
+              Type: Api,
+              Properties: { Path: "/product/{id}", Method: delete },
+            },
+        }
+      Environment: { Variables: { PRODUCT_TABLE_NAME: !Ref ProductTable } }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ProductTable }
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [handlers.ts],
+          },
+      }
+
+  UpdateProduct:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/ProductService
+      Handler: handlers.updateProductHandler
+      Events:
+        {
+          ApiPut:
+            { Type: Api, Properties: { Path: "/product/{id}", Method: put } },
+        }
+      Environment: { Variables: { PRODUCT_TABLE_NAME: !Ref ProductTable } }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ProductTable }
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [handlers.ts],
+          },
+      }
+
+  CreateProduct:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/ProductService
+      Handler: handlers.createProductHandler
+      Events:
+        { ApiPost: { Type: Api, Properties: { Path: /product, Method: post } } }
+      Environment: { Variables: { PRODUCT_TABLE_NAME: !Ref ProductTable } }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ProductTable }
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [handlers.ts],
+          },
+      }
+
+  GetAllProductsFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/ProductService
+      Handler: handlers.getAllProductsHandler
+      Events:
+        {
+          ApiGetAll:
+            { Type: Api, Properties: { Path: /products, Method: get } },
+        }
+      Environment: { Variables: { PRODUCT_TABLE_NAME: !Ref ProductTable } }
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref ProductTable }
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [handlers.ts],
+          },
+      }
+
+  ########################
+  # Tenant Management — Lambdas & API
+  ########################
+
+  # tenant-management.ts
+  CreateTenantFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/TenantManagmentService
+      Handler: tenant-management.createTenant
+      Events:
+        {
+          ApiPost:
+            {
+              Type: Api,
+              Properties:
+                { Path: /tenant, Method: post, Auth: { Authorizer: NONE } },
+            },
+        }
+      Environment:
+        Variables:
+          TABLE_TENANT_DETAILS: !Ref TenantDetailsTable
+          TABLE_SETTINGS: !Ref SettingsTable
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TenantDetailsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref SettingsTable }
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [tenant-management.ts],
+          },
+      }
+
+  GetTenantsFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/TenantManagmentService
+      Handler: tenant-management.getTenants
+      Events:
+        {
+          ApiGetAll: { Type: Api, Properties: { Path: /tenants, Method: get } },
+        }
+      Environment:
+        {
+          Variables:
+            {
+              TABLE_TENANT_DETAILS: !Ref TenantDetailsTable,
+              TABLE_SETTINGS: !Ref SettingsTable,
+            },
+        }
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref TenantDetailsTable }
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [tenant-management.ts],
+          },
+      }
+
+  UpdateTenantFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/TenantManagmentService
+      Handler: tenant-management.updateTenant
+      Events:
+        {
+          ApiPut:
+            {
+              Type: Api,
+              Properties: { Path: "/tenant/{tenantid}", Method: put },
+            },
+        }
+      Environment:
+        {
+          Variables:
+            {
+              TABLE_TENANT_DETAILS: !Ref TenantDetailsTable,
+              TABLE_SETTINGS: !Ref SettingsTable,
+            },
+        }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TenantDetailsTable }
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [tenant-management.ts],
+          },
+      }
+
+  GetTenantFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/TenantManagmentService
+      Handler: tenant-management.getTenant
+      Events:
+        {
+          ApiGet:
+            {
+              Type: Api,
+              Properties: { Path: "/tenant/{tenantid}", Method: get },
+            },
+        }
+      Environment:
+        {
+          Variables:
+            {
+              TABLE_TENANT_DETAILS: !Ref TenantDetailsTable,
+              TABLE_SETTINGS: !Ref SettingsTable,
+            },
+        }
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref TenantDetailsTable }
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [tenant-management.ts],
+          },
+      }
+
+  ActivateTenantFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/TenantManagmentService
+      Handler: tenant-management.activateTenant
+      Events:
+        {
+          ApiPut:
+            {
+              Type: Api,
+              Properties:
+                { Path: "/tenant/activation/{tenantid}", Method: put },
+            },
+        }
+      Environment:
+        {
+          Variables:
+            {
+              TABLE_TENANT_DETAILS: !Ref TenantDetailsTable,
+              TABLE_SETTINGS: !Ref SettingsTable,
+            },
+        }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TenantDetailsTable }
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [tenant-management.ts],
+          },
+      }
+
+  DeactivateTenantFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/TenantManagmentService
+      Handler: tenant-management.deactivateTenant
+      Events:
+        {
+          ApiDel:
+            {
+              Type: Api,
+              Properties: { Path: "/tenant/{tenantid}", Method: delete },
+            },
+        }
+      Environment:
+        {
+          Variables:
+            {
+              TABLE_TENANT_DETAILS: !Ref TenantDetailsTable,
+              TABLE_SETTINGS: !Ref SettingsTable,
+            },
+        }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TenantDetailsTable }
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [tenant-management.ts],
+          },
+      }
+
+  LoadTenantConfigFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/TenantManagmentService
+      Handler: tenant-management.loadTenantConfig
+      Events:
+        {
+          ApiGet:
+            {
+              Type: Api,
+              Properties: { Path: "/tenant/init/{tenantname}", Method: get },
+            },
+        }
+      Environment:
+        {
+          Variables:
+            {
+              TABLE_TENANT_DETAILS: !Ref TenantDetailsTable,
+              TABLE_SETTINGS: !Ref SettingsTable,
+            },
+        }
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref TenantDetailsTable }
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [tenant-management.ts],
+          },
+      }
+
+  # tenant-registration.ts
+  RegisterTenantFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/TenantManagmentService
+      Handler: tenant-registration.registerTenant
+      Events:
+        {
+          ApiPost:
+            {
+              Type: Api,
+              Properties:
+                {
+                  Path: /registration,
+                  Method: post,
+                  Auth: { Authorizer: NONE },
+                },
+            },
+        }
+      Environment:
+        Variables:
+          CREATE_TENANT_ADMIN_USER_RESOURCE_PATH: "/user/tenant-admin"
+          CREATE_TENANT_RESOURCE_PATH: "/tenant"
+          PROVISION_TENANT_RESOURCE_PATH: "/provisioning"
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ReadApiKeysFromSsm
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+                - ssm:GetParametersByPath
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/api-keys/*
+            - Sid: ManageApiGatewayForPremiumTenants
+              Effect: Allow
+              Action:
+                - apigateway:POST
+                - apigateway:GET
+                - apigateway:PUT
+              Resource:
+                - !Sub arn:aws:apigateway:${AWS::Region}::/apikeys
+                - !Sub arn:aws:apigateway:${AWS::Region}::/apikeys/*
+                - !Sub arn:aws:apigateway:${AWS::Region}::/usageplans
+                - !Sub arn:aws:apigateway:${AWS::Region}::/usageplans/*
+
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [tenant-registration.ts],
+          },
+      }
+
+  # user-management.ts
+  CreateTenantAdminUserFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/TenantManagmentService
+      Handler: user-management.createTenantAdminUser
+      Events:
+        {
+          ApiPost:
+            {
+              Type: Api,
+              Properties:
+                {
+                  Path: /user/tenant-admin,
+                  Method: post,
+                  Auth: { Authorizer: NONE },
+                },
+            },
+        }
+      Environment:
+        Variables:
+          TENANT_USER_POOL_ID: !Ref PooledUserPool
+          TENANT_APP_CLIENT_ID: !Ref PooledUserPoolClient
+          TABLE_TENANT_USER_MAPPING: !Ref TenantUserMappingTable
+          TABLE_TENANT_DETAILS: !Ref TenantDetailsTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:AdminCreateUser
+                - cognito-idp:AdminAddUserToGroup
+              Resource: "*"
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [user-management.ts],
+          },
+      }
+
+  GetUsersFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/TenantManagmentService
+      Handler: user-management.getUsers
+      Events:
+        { ApiGet: { Type: Api, Properties: { Path: /users, Method: get } } }
+      Environment:
+        Variables:
+          TENANT_USER_POOL_ID: !Ref PooledUserPool
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [cognito-idp:ListUsers]
+              Resource: "*"
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [user-management.ts],
+          },
+      }
+
+  DisableUsersByTenantFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/TenantManagmentService
+      Handler: user-management.disableUsersByTenant
+      Events:
+        {
+          ApiPut:
+            { Type: Api, Properties: { Path: /users/disable, Method: put } },
+        }
+      Environment:
+        Variables:
+          TABLE_TENANT_USER_MAPPING: !Ref TenantUserMappingTable
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref TenantUserMappingTable }
+        - Statement:
+            - Effect: Allow
+              Action: [cognito-idp:AdminDisableUser]
+              Resource: "*"
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [user-management.ts],
+          },
+      }
+
+  ProvisionTenantFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/TenantManagmentService
+      Handler: tenant-provisioning.provisionTenant
+      Events:
+        ApiPost:
+          Type: Api
+          Properties:
+            Path: /provisioning
+            Method: post
+            Auth:
+              Authorizer: NONE
+      Environment:
+        Variables:
+          TENANT_STACK_MAPPING_TABLE_NAME: !Ref TenantStackMappingTable
+          PIPELINE_NAME: "serverless-saas-pipeline"
+      Policies:
+        # доступ до DynamoDB таблиці TenantStackMapping
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TenantStackMappingTable
+
+        # дозвіл стартувати CodePipeline
+        - Statement:
+            - Effect: Allow
+              Action:
+                - codepipeline:StartPipelineExecution
+              Resource: "*" # можна потім звузити до конкретного пайплайна
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+        EntryPoints: [tenant-provisioning.ts]
+
+  DeProvisionTenantFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/TenantManagmentService
+      Handler: tenant-provisioning.deprovisionTenant
+      Events:
+        ApiPut:
+          Type: Api
+          Properties:
+            Path: /provisioning/{tenantid}
+            Method: put
+      Environment:
+        Variables:
+          TENANT_STACK_MAPPING_TABLE_NAME: !Ref TenantStackMappingTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TenantStackMappingTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cloudformation:DeleteStack
+              Resource: "*" # можеш звузити до arn стека кожного тенанта
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+        EntryPoints: [tenant-provisioning.ts]
+
+  ########################
+  # (Optional) App Insights
+  ########################
+  ApplicationResourceGroup:
+    Type: AWS::ResourceGroups::Group
+    Properties:
+      Name: !Sub ApplicationInsights-SAM-${AWS::StackName}
+      ResourceQuery: { Type: CLOUDFORMATION_STACK_1_0 }
+
+  ApplicationInsightsMonitoring:
+    Type: AWS::ApplicationInsights::Application
+    Properties:
+      ResourceGroupName: !Ref ApplicationResourceGroup
+      AutoConfigurationEnabled: true
+
+  ########################
+  # Lambda Authorizer
+  ########################
+  AuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: TenantAuthorizer
+      CodeUri: src/AuthService
+      Handler: authorizer.handler
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_TENANT_DETAILS: !Ref TenantDetailsTable
+          POOLED_USER_POOL_ID: !Ref PooledUserPool
+          POOLED_APP_CLIENT_ID: !Ref PooledUserPoolClient
+          OPERATION_USERS_API_KEY: !Ref SystemAdminApiKey
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref TenantDetailsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sts:AssumeRole
+              Resource: !GetAtt AuthorizerAccessRole.Arn
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+        EntryPoints: [authorizer.ts]
+        External: ["@aws-sdk/*"]
+
+  ########################
+  # IAM Role for Authorizer STS
+  ########################
+  AuthorizerAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: authorizer-access-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/Product-*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/Order-*"
+                  - !GetAtt ProductTable.Arn
+                  - !GetAtt OrderTable.Arn
+
+  ########################
+  # API Keys
+  ########################
+  ApiKeyPlatinumTier:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: ServerlessSaaS-Platinum-Key-v2
+      Description: API key for Platinum tier tenants
+      Enabled: true
+      Value: !Ref PlatinumTierApiKey
+
+  ApiKeyPremiumTier:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: ServerlessSaaS-Premium-Key-v2
+      Description: API key for Premium tier tenants
+      Enabled: true
+      Value: !Ref PremiumTierApiKey
+
+  ApiKeyStandardTier:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: ServerlessSaaS-Standard-Key-v2
+      Description: API key for Standard tier tenants
+      Enabled: true
+      Value: !Ref StandardTierApiKey
+
+  ApiKeyBasicTier:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: ServerlessSaaS-Basic-Key-v2
+      Description: API key for Basic tier tenants
+      Enabled: true
+      Value: !Ref BasicTierApiKey
+
+  ApiKeySystemAdmin:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: ServerlessSaaS-Admin-Key-v2
+      Description: API key for System Administrators
+      Enabled: true
+      Value: !Ref SystemAdminApiKey
+
+  ########################
+  # Usage Plans
+  ########################
+  UsagePlanPlatinumTier:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ServerlessRestApiProdStage
+    Properties:
+      UsagePlanName: Plan_Platinum_Tier
+      Description: Usage plan for Platinum tier tenants - highest limits
+      ApiStages:
+        - ApiId: !Ref ServerlessRestApi
+          Stage: Prod
+      Quota:
+        Limit: 10000
+        Period: DAY
+      Throttle:
+        BurstLimit: 300
+        RateLimit: 300
+
+  UsagePlanPremiumTier:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ServerlessRestApiProdStage
+    Properties:
+      UsagePlanName: Plan_Premium_Tier
+      Description: Usage plan for Premium tier tenants
+      ApiStages:
+        - ApiId: !Ref ServerlessRestApi
+          Stage: Prod
+      Quota:
+        Limit: 5000
+        Period: DAY
+      Throttle:
+        BurstLimit: 200
+        RateLimit: 100
+
+  UsagePlanStandardTier:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ServerlessRestApiProdStage
+    Properties:
+      UsagePlanName: Plan_Standard_Tier
+      Description: Usage plan for Standard tier tenants
+      ApiStages:
+        - ApiId: !Ref ServerlessRestApi
+          Stage: Prod
+      Quota:
+        Limit: 3000
+        Period: DAY
+      Throttle:
+        BurstLimit: 100
+        RateLimit: 75
+
+  UsagePlanBasicTier:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ServerlessRestApiProdStage
+    Properties:
+      UsagePlanName: Plan_Basic_Tier
+      Description: Usage plan for Basic tier tenants - lowest limits
+      ApiStages:
+        - ApiId: !Ref ServerlessRestApi
+          Stage: Prod
+      Quota:
+        Limit: 500
+        Period: DAY
+      Throttle:
+        BurstLimit: 50
+        RateLimit: 50
+
+  UsagePlanSystemAdmin:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ServerlessRestApiProdStage
+    Properties:
+      UsagePlanName: Plan_System_Admin
+      Description: Usage plan for System Administrators
+      ApiStages:
+        - ApiId: !Ref ServerlessRestApi
+          Stage: Prod
+      Quota:
+        Limit: 50000
+        Period: DAY
+      Throttle:
+        BurstLimit: 500
+        RateLimit: 500
+
+  ########################
+  # Usage Plan Key Associations
+  ########################
+  UsagePlanKeyPlatinum:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKeyPlatinumTier
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlanPlatinumTier
+
+  UsagePlanKeyPremium:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKeyPremiumTier
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlanPremiumTier
+
+  UsagePlanKeyStandard:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKeyStandardTier
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlanStandardTier
+
+  UsagePlanKeyBasic:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKeyBasicTier
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlanBasicTier
+
+  UsagePlanKeySystemAdmin:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKeySystemAdmin
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlanSystemAdmin
+
+Outputs:
+  ApiBaseUrl:
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+  SettingsTableName:
+    Value: !Ref SettingsTable
+  TenantDetailsTableName:
+    Value: !Ref TenantDetailsTable
+  TenantUserMappingTableName:
+    Value: !Ref TenantUserMappingTable
+  PooledUserPoolId:
+    Value: !Ref PooledUserPool
+  PooledUserPoolClientId:
+    Value: !Ref PooledUserPoolClient
+  TenantStackMappingTableName:
+    Value: !Ref TenantStackMappingTable
+  AuthorizerFunctionArn:
+    Value: !GetAtt AuthorizerFunction.Arn
+  UsagePlanBasicTierId:
+    Value: !Ref UsagePlanBasicTier
+  UsagePlanStandardTierId:
+    Value: !Ref UsagePlanStandardTier
+  UsagePlanPremiumTierId:
+    Value: !Ref UsagePlanPremiumTier
+  UsagePlanPlatinumTierId:
+    Value: !Ref UsagePlanPlatinumTier

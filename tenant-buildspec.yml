@@ -1,0 +1,40 @@
+version: 0.2
+
+env:
+  variables:
+    PROJECT_DIR: diplom-sam-app
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+      python: 3.11
+    commands:
+      # Install SAM CLI via pip
+      - pip install aws-sam-cli
+      - sam --version
+      # Install esbuild globally (required for SAM to bundle Lambda functions)
+      - npm install -g esbuild
+      # Install project dependencies
+      - cd $CODEBUILD_SRC_DIR/$PROJECT_DIR && npm ci
+
+  pre_build:
+    commands:
+      # Compile TypeScript
+      - cd $CODEBUILD_SRC_DIR/$PROJECT_DIR && npm run build
+
+  build:
+    commands:
+      # Build SAM application using tenant-template.yaml
+      - cd $CODEBUILD_SRC_DIR/$PROJECT_DIR && sam build -t tenant-template.yaml
+
+  post_build:
+    commands:
+      # Package and upload to S3
+      - cd $CODEBUILD_SRC_DIR/$PROJECT_DIR && sam package --template-file .aws-sam/build/template.yaml --s3-bucket $PACKAGE_BUCKET --output-template-file packaged.yaml --no-progressbar
+
+artifacts:
+  discard-paths: yes
+  base-directory: diplom-sam-app
+  files:
+    - packaged.yaml

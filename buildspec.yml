@@ -1,0 +1,15 @@
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - npm install -g aws-sam-cli
+      - npm ci
+  build:
+    commands:
+      - npm run build
+      - sam build
+      - sam package --s3-bucket $PACKAGE_BUCKET --output-template-file packaged.yaml
+artifacts:
+  files:
+    - packaged.yaml

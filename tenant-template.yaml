@@ -1,0 +1,389 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless SaaS - Silo Tenant Stack (TypeScript)
+  This template deploys isolated resources for a single premium/platinum tenant.
+
+Globals:
+  Function:
+    Timeout: 10
+    Runtime: nodejs22.x
+    Tracing: Active
+    LoggingConfig: { LogFormat: JSON }
+
+Parameters:
+  TenantIdParameter:
+    Type: String
+    Default: "pooled"
+    Description: "Tenant ID for this stack"
+  StageName:
+    Type: String
+    Default: "prod"
+    Description: "Stage Name for the API"
+
+Conditions:
+  IsPooledDeploy: !Equals [!Ref TenantIdParameter, "pooled"]
+  IsSiloDeploy: !Not [!Equals [!Ref TenantIdParameter, "pooled"]]
+
+Resources:
+  ########################
+  # DynamoDB Tables (per-tenant isolated)
+  ########################
+  ProductTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Join ["-", ["Product", !Ref TenantIdParameter]]
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: shardId, AttributeType: S }
+        - { AttributeName: productId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: shardId, KeyType: HASH }
+        - { AttributeName: productId, KeyType: RANGE }
+      Tags:
+        - Key: TenantId
+          Value: !Ref TenantIdParameter
+
+  OrderTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Join ["-", ["Order", !Ref TenantIdParameter]]
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: shardId, AttributeType: S }
+        - { AttributeName: orderId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: shardId, KeyType: HASH }
+        - { AttributeName: orderId, KeyType: RANGE }
+      Tags:
+        - Key: TenantId
+          Value: !Ref TenantIdParameter
+
+  ########################
+  # IAM Roles (per-tenant isolated)
+  ########################
+  ProductFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ["-", [!Ref TenantIdParameter, "product-function-role"]]
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
+
+  ProductFunctionExecutionRolePolicy:
+    Type: AWS::IAM::Policy
+    Condition: IsSiloDeploy
+    Properties:
+      PolicyName:
+        !Join ["-", [!Ref TenantIdParameter, "product-function-policy"]]
+      Roles:
+        - !Ref ProductFunctionExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:UpdateItem
+              - dynamodb:PutItem
+              - dynamodb:DeleteItem
+              - dynamodb:Query
+            Resource:
+              - !GetAtt ProductTable.Arn
+
+  OrderFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ["-", [!Ref TenantIdParameter, "order-function-role"]]
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
+
+  OrderFunctionExecutionRolePolicy:
+    Type: AWS::IAM::Policy
+    Condition: IsSiloDeploy
+    Properties:
+      PolicyName: !Join ["-", [!Ref TenantIdParameter, "order-function-policy"]]
+      Roles:
+        - !Ref OrderFunctionExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:UpdateItem
+              - dynamodb:PutItem
+              - dynamodb:DeleteItem
+              - dynamodb:Query
+            Resource:
+              - !GetAtt OrderTable.Arn
+
+  ########################
+  # Product Service Lambdas
+  ########################
+  GetProductFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ProductFunctionExecutionRole
+    Properties:
+      FunctionName: !Join ["-", [!Ref TenantIdParameter, "GetProduct"]]
+      CodeUri: src/ProductService
+      Handler: handlers.getProductHandler
+      Role: !GetAtt ProductFunctionExecutionRole.Arn
+      Environment:
+        Variables:
+          PRODUCT_TABLE_NAME: !Ref ProductTable
+          IS_POOLED_DEPLOY: !If [IsPooledDeploy, "true", "false"]
+          TENANT_ID: !Ref TenantIdParameter
+      Tags:
+        TenantId: !Ref TenantIdParameter
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+        EntryPoints: [handlers.ts]
+
+  GetProductsFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ProductFunctionExecutionRole
+    Properties:
+      FunctionName: !Join ["-", [!Ref TenantIdParameter, "GetProducts"]]
+      CodeUri: src/ProductService
+      Handler: handlers.getAllProductsHandler
+      Role: !GetAtt ProductFunctionExecutionRole.Arn
+      Environment:
+        Variables:
+          PRODUCT_TABLE_NAME: !Ref ProductTable
+          IS_POOLED_DEPLOY: !If [IsPooledDeploy, "true", "false"]
+          TENANT_ID: !Ref TenantIdParameter
+      Tags:
+        TenantId: !Ref TenantIdParameter
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+        EntryPoints: [handlers.ts]
+
+  CreateProductFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ProductFunctionExecutionRole
+    Properties:
+      FunctionName: !Join ["-", [!Ref TenantIdParameter, "CreateProduct"]]
+      CodeUri: src/ProductService
+      Handler: handlers.createProductHandler
+      Role: !GetAtt ProductFunctionExecutionRole.Arn
+      Environment:
+        Variables:
+          PRODUCT_TABLE_NAME: !Ref ProductTable
+          IS_POOLED_DEPLOY: !If [IsPooledDeploy, "true", "false"]
+          TENANT_ID: !Ref TenantIdParameter
+      Tags:
+        TenantId: !Ref TenantIdParameter
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+        EntryPoints: [handlers.ts]
+
+  UpdateProductFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ProductFunctionExecutionRole
+    Properties:
+      FunctionName: !Join ["-", [!Ref TenantIdParameter, "UpdateProduct"]]
+      CodeUri: src/ProductService
+      Handler: handlers.updateProductHandler
+      Role: !GetAtt ProductFunctionExecutionRole.Arn
+      Environment:
+        Variables:
+          PRODUCT_TABLE_NAME: !Ref ProductTable
+          IS_POOLED_DEPLOY: !If [IsPooledDeploy, "true", "false"]
+          TENANT_ID: !Ref TenantIdParameter
+      Tags:
+        TenantId: !Ref TenantIdParameter
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+        EntryPoints: [handlers.ts]
+
+  DeleteProductFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ProductFunctionExecutionRole
+    Properties:
+      FunctionName: !Join ["-", [!Ref TenantIdParameter, "DeleteProduct"]]
+      CodeUri: src/ProductService
+      Handler: handlers.deleteProductHandler
+      Role: !GetAtt ProductFunctionExecutionRole.Arn
+      Environment:
+        Variables:
+          PRODUCT_TABLE_NAME: !Ref ProductTable
+          IS_POOLED_DEPLOY: !If [IsPooledDeploy, "true", "false"]
+          TENANT_ID: !Ref TenantIdParameter
+      Tags:
+        TenantId: !Ref TenantIdParameter
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+        EntryPoints: [handlers.ts]
+
+  ########################
+  # Order Service Lambdas
+  ########################
+  GetOrderFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: OrderFunctionExecutionRole
+    Properties:
+      FunctionName: !Join ["-", [!Ref TenantIdParameter, "GetOrder"]]
+      CodeUri: src/OrderService
+      Handler: handlers.getOrderHandler
+      Role: !GetAtt OrderFunctionExecutionRole.Arn
+      Environment:
+        Variables:
+          ORDER_TABLE_NAME: !Ref OrderTable
+          IS_POOLED_DEPLOY: !If [IsPooledDeploy, "true", "false"]
+          TENANT_ID: !Ref TenantIdParameter
+      Tags:
+        TenantId: !Ref TenantIdParameter
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+        EntryPoints: [handlers.ts]
+
+  GetOrdersFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: OrderFunctionExecutionRole
+    Properties:
+      FunctionName: !Join ["-", [!Ref TenantIdParameter, "GetOrders"]]
+      CodeUri: src/OrderService
+      Handler: handlers.getAllOrdersHandler
+      Role: !GetAtt OrderFunctionExecutionRole.Arn
+      Environment:
+        Variables:
+          ORDER_TABLE_NAME: !Ref OrderTable
+          IS_POOLED_DEPLOY: !If [IsPooledDeploy, "true", "false"]
+          TENANT_ID: !Ref TenantIdParameter
+      Tags:
+        TenantId: !Ref TenantIdParameter
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+        EntryPoints: [handlers.ts]
+
+  CreateOrderFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: OrderFunctionExecutionRole
+    Properties:
+      FunctionName: !Join ["-", [!Ref TenantIdParameter, "CreateOrder"]]
+      CodeUri: src/OrderService
+      Handler: handlers.createOrderHandler
+      Role: !GetAtt OrderFunctionExecutionRole.Arn
+      Environment:
+        Variables:
+          ORDER_TABLE_NAME: !Ref OrderTable
+          IS_POOLED_DEPLOY: !If [IsPooledDeploy, "true", "false"]
+          TENANT_ID: !Ref TenantIdParameter
+      Tags:
+        TenantId: !Ref TenantIdParameter
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+        EntryPoints: [handlers.ts]
+
+  UpdateOrderFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: OrderFunctionExecutionRole
+    Properties:
+      FunctionName: !Join ["-", [!Ref TenantIdParameter, "UpdateOrder"]]
+      CodeUri: src/OrderService
+      Handler: handlers.updateOrderHandler
+      Role: !GetAtt OrderFunctionExecutionRole.Arn
+      Environment:
+        Variables:
+          ORDER_TABLE_NAME: !Ref OrderTable
+          IS_POOLED_DEPLOY: !If [IsPooledDeploy, "true", "false"]
+          TENANT_ID: !Ref TenantIdParameter
+      Tags:
+        TenantId: !Ref TenantIdParameter
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+        EntryPoints: [handlers.ts]
+
+  DeleteOrderFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: OrderFunctionExecutionRole
+    Properties:
+      FunctionName: !Join ["-", [!Ref TenantIdParameter, "DeleteOrder"]]
+      CodeUri: src/OrderService
+      Handler: handlers.deleteOrderHandler
+      Role: !GetAtt OrderFunctionExecutionRole.Arn
+      Environment:
+        Variables:
+          ORDER_TABLE_NAME: !Ref OrderTable
+          IS_POOLED_DEPLOY: !If [IsPooledDeploy, "true", "false"]
+          TENANT_ID: !Ref TenantIdParameter
+      Tags:
+        TenantId: !Ref TenantIdParameter
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+        EntryPoints: [handlers.ts]
+
+Outputs:
+  TenantId:
+    Description: "Tenant ID for this stack"
+    Value: !Ref TenantIdParameter
+  ProductTableName:
+    Description: "Product table for this tenant"
+    Value: !Ref ProductTable
+  OrderTableName:
+    Description: "Order table for this tenant"
+    Value: !Ref OrderTable
+  GetProductFunctionArn:
+    Description: "GetProduct Lambda ARN"
+    Value: !GetAtt GetProductFunction.Arn
+  GetOrderFunctionArn:
+    Description: "GetOrder Lambda ARN"
+    Value: !GetAtt GetOrderFunction.Arn
