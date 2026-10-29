@@ -8,6 +8,7 @@ import { CognitoJwtVerifier } from "aws-jwt-verify";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand } from "@aws-sdk/lib-dynamodb";
 import { STSClient, AssumeRoleCommand, Credentials } from "@aws-sdk/client-sts";
+import { UserRole, isSaaSProvider } from "../shared/auth";
 
 const region = process.env.AWS_REGION || "eu-central-1";
 
@@ -41,20 +42,10 @@ const TENANT_DETAILS_TABLE =
   process.env.TABLE_TENANT_DETAILS || "ServerlessSaaS-TenantDetails";
 const POOLED_USER_POOL_ID = process.env.POOLED_USER_POOL_ID!;
 const POOLED_APP_CLIENT_ID = process.env.POOLED_APP_CLIENT_ID!;
-const OPERATION_USERS_API_KEY =
-  process.env.OPERATION_USERS_API_KEY || "SYSTEM-ADMIN-KEY";
-
-// User roles
-enum UserRole {
-  SYSTEM_ADMIN = "SystemAdmin",
-  CUSTOMER_SUPPORT = "CustomerSupport",
-  TENANT_ADMIN = "TenantAdmin",
-  TENANT_USER = "TenantUser",
-}
-
-const isSaaSProvider = (role: string): boolean => {
-  return role === UserRole.SYSTEM_ADMIN || role === UserRole.CUSTOMER_SUPPORT;
-};
+const OPERATION_USERS_API_KEY = process.env.OPERATION_USERS_API_KEY!;
+// Account-wide SaaS provider operators are not a tenant; this ID marks them
+// in the context and in their (unscoped) STS session.
+const SAAS_PROVIDER_TENANT_ID = "saas-provider";
 
 interface TenantDetails {
   tenantId: string;
@@ -63,6 +54,8 @@ interface TenantDetails {
   apiGatewayUrl?: string;
   apiKey: string;
   tenantTier: string;
+  dedicatedTenancy?: string;
+  isActive?: boolean;
 }
 
 interface JwtClaims {
@@ -141,15 +134,16 @@ function createVerifier(userPoolId: string, clientId: string) {
 }
 
 /**
- * Generate IAM policy for tenant isolation
+ * Generate the STS session policy for tenant isolation
  */
-function generateTenantPolicy(
+export function generateTenantPolicy(
   tenantId: string,
   userRole: string,
   awsAccountId: string,
 ): string {
-  if (userRole === UserRole.SYSTEM_ADMIN) {
-    // System admin has access to all tables
+  if (isSaaSProvider(userRole)) {
+    // SaaS provider operators can read and write all tenants' data. The
+    // role's own policy still limits this to the Product/Order tables.
     return JSON.stringify({
       Version: "2012-10-17",
       Statement: [
@@ -187,7 +181,7 @@ function generateTenantPolicy(
           // Pooled tables for STANDARD/BASIC tiers
           `arn:aws:dynamodb:${region}:${awsAccountId}:table/ProductTable`,
           `arn:aws:dynamodb:${region}:${awsAccountId}:table/OrderTable`,
-          // Silo tables for PLATINUM/PREMIUM tiers
+          // Silo tables for dedicated (PLATINUM) tenants
           `arn:aws:dynamodb:${region}:${awsAccountId}:table/Product-*`,
           `arn:aws:dynamodb:${region}:${awsAccountId}:table/Order-*`,
         ],
@@ -287,13 +281,21 @@ function buildPolicyDocument(
 }
 
 /**
+ * Decode the JWT payload without verifying it. Only used to pick the user
+ * pool to verify against; every decision afterwards uses verified claims.
+ */
+function decodeUnverified(token: string): Partial<JwtClaims> {
+  const [, payloadBase64] = token.split(".");
+  if (!payloadBase64) throw new Error("Malformed token");
+  return JSON.parse(Buffer.from(payloadBase64, "base64url").toString());
+}
+
+/**
  * Main Lambda Authorizer handler
  */
 export const handler = async (
   event: APIGatewayTokenAuthorizerEvent,
 ): Promise<APIGatewayAuthorizerResult> => {
-  console.log("Authorizer event:", JSON.stringify(event, null, 2));
-
   try {
     // Extract JWT token
     const authHeader = event.authorizationToken;
@@ -302,31 +304,29 @@ export const handler = async (
     }
     const token = authHeader.split(" ")[1];
 
-    // Decode token without verification to get tenantId
-    const [, payloadBase64] = token.split(".");
-    const payload = JSON.parse(
-      Buffer.from(payloadBase64, "base64").toString(),
-    ) as JwtClaims;
-
-    const userRole = payload["custom:userRole"];
-    const tenantId = payload["custom:tenantId"];
+    const unverified = decodeUnverified(token);
 
     let userPoolId: string;
     let appClientId: string;
     let apiKey: string;
+    let tenantDetails: TenantDetails | null = null;
 
     // Determine which user pool to validate against
-    if (isSaaSProvider(userRole)) {
+    if (isSaaSProvider(String(unverified["custom:userRole"]))) {
       // SaaS provider uses pooled user pool
       userPoolId = POOLED_USER_POOL_ID;
       appClientId = POOLED_APP_CLIENT_ID;
       apiKey = OPERATION_USERS_API_KEY;
     } else {
       // Get tenant-specific details
-      const tenantDetails = await getTenantDetails(tenantId);
+      tenantDetails = await getTenantDetails(
+        String(unverified["custom:tenantId"]),
+      );
       if (!tenantDetails) {
-        console.error(`Tenant not found: ${tenantId}`);
-        throw new Error("Unauthorized");
+        throw new Error("Tenant not found");
+      }
+      if (tenantDetails.isActive === false) {
+        throw new Error("Tenant is deactivated");
       }
 
       userPoolId = tenantDetails.userPoolId || POOLED_USER_POOL_ID;
@@ -338,7 +338,18 @@ export const handler = async (
     const verifier = createVerifier(userPoolId, appClientId);
     const verifiedPayload = await verifier.verify(token);
 
-    console.log("Token verified successfully:", verifiedPayload.sub);
+    const userRole = String(verifiedPayload["custom:userRole"]);
+    const tenantId = isSaaSProvider(userRole)
+      ? SAAS_PROVIDER_TENANT_ID
+      : String(verifiedPayload["custom:tenantId"]);
+
+    // The verified claims must match the tenant whose details we loaded
+    if (tenantDetails && tenantDetails.tenantId !== tenantId) {
+      throw new Error("Tenant claim mismatch");
+    }
+    if (!(Object.values(UserRole) as string[]).includes(userRole)) {
+      throw new Error("Unknown user role");
+    }
 
     // Parse method ARN
     const arnParts = event.methodArn.split(":");
@@ -347,32 +358,29 @@ export const handler = async (
     const restApiId = apiGatewayArnParts[0];
     const stage = apiGatewayArnParts[1];
 
-    // Get scoped credentials for tenant isolation
+    // Get scoped credentials for tenant isolation. Fail closed: without
+    // them the business functions would have no tenant-scoped access.
     const credentials = await getScopedCredentials(
       tenantId,
       userRole,
       awsAccountId,
     );
+    if (!credentials) {
+      throw new Error("Could not obtain tenant-scoped credentials");
+    }
 
     // Build context to pass to Lambda functions
     const context: Record<string, string | boolean> = {
       tenantId,
       userRole,
-      userName: String(
-        verifiedPayload["cognito:username"] ||
-          payload["cognito:username"] ||
-          "",
-      ),
+      userName: String(verifiedPayload["cognito:username"] ?? ""),
       userPoolId,
-      apiKey,
+      tenantTier: tenantDetails?.tenantTier ?? "",
+      dedicatedTenancy: tenantDetails?.dedicatedTenancy ?? "false",
+      accessKeyId: credentials.AccessKeyId!,
+      secretAccessKey: credentials.SecretAccessKey!,
+      sessionToken: credentials.SessionToken!,
     };
-
-    // Add STS credentials if available
-    if (credentials) {
-      context.accessKeyId = credentials.AccessKeyId!;
-      context.secretAccessKey = credentials.SecretAccessKey!;
-      context.sessionToken = credentials.SessionToken!;
-    }
 
     // Build policy - allow all methods
     const policyDocument = buildPolicyDocument(
@@ -389,10 +397,12 @@ export const handler = async (
       usageIdentifierKey: apiKey,
     };
 
-    console.log("Authorizer response:", JSON.stringify(response, null, 2));
+    // Never log the token, the response or the credentials
+    console.log(`Authorized ${userRole} for tenant ${tenantId}`);
     return response;
   } catch (error) {
-    console.error("Authorization failed:", error);
+    console.warn("Authorization failed:", (error as Error).message);
+    // API Gateway maps exactly this message to a 401 response
     throw new Error("Unauthorized");
   }
 };

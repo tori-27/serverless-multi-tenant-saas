@@ -1,5 +1,7 @@
 # Serverless Architecture in Multi-Tenant Web Applications
 
+[![CI](https://github.com/tori-27/serverless-multi-tenant-saas/actions/workflows/ci.yml/badge.svg)](https://github.com/tori-27/serverless-multi-tenant-saas/actions/workflows/ci.yml)
+
 > Master's thesis project: *Serverless architektúra v multitenantných webových aplikáciách*
 > Technical University of Košice, Faculty of Electrical Engineering and Informatics, Department of Computers and Informatics
 > Author: **Bc. Dmytro Poslavskyi** · Supervisor: Ing. Dominik Lakatoš, PhD. · Consultant: Ing. Tomáš Kormaník
@@ -36,9 +38,9 @@ The system has these parts:
 | **BASIC**    | Pooled     | Shared `ProductTable` / `OrderTable`   | Shared tier usage plan: 50 rps, burst 50, 500/day |
 | **STANDARD** | Pooled     | Shared tables                          | Shared tier usage plan: 75 rps, burst 100, 3000/day |
 | **PREMIUM**  | Pooled     | Shared tables                          | **Per-tenant** API key and usage plan: 100 rps, burst 200, 5000/day |
-| **PLATINUM** | **Siloed** | Dedicated `Product-<tenantId>` / `Order-<tenantId>` tables and Lambdas | Dedicated usage plan: 300 rps, burst 300, 10000/day |
+| **PLATINUM** | **Siloed** | Dedicated `Product-<tenantId>` / `Order-<tenantId>` tables | Dedicated usage plan: 300 rps, burst 300, 10000/day |
 
-On registration, PREMIUM tenants get their own API key and usage plan, created at runtime ([tenant-registration.ts](src/TenantManagmentService/tenant-registration.ts)). PLATINUM tenants are marked `dedicated` and get their own CloudFormation stack from [tenant-template.yaml](tenant-template.yaml).
+On registration, PREMIUM tenants get their own API key and usage plan, created at runtime ([tenant-registration.ts](src/TenantManagmentService/tenant-registration.ts)). PLATINUM tenants are marked `dedicated` and get their own CloudFormation stack from [tenant-template.yaml](tenant-template.yaml). The data layer picks the table from the authorizer context: `Product-<tenantId>` for dedicated tenants, the shared `ProductTable` for everyone else ([ddb.ts](src/shared/ddb.ts)).
 
 ## Authentication, authorization and tenant isolation
 
@@ -47,11 +49,11 @@ On registration, PREMIUM tenants get their own API key and usage plan, created a
 1. The user signs in through Cognito and receives a JWT with `custom:tenantId` and `custom:userRole`.
 2. The client calls API Gateway with `Authorization: Bearer <JWT>`.
 3. The **Lambda Authorizer** ([authorizer.ts](src/AuthService/authorizer.ts)) does the following:
-   - looks up tenant details (user pool, app client, API key, tier) in `ServerlessSaaS-TenantDetails`;
-   - verifies the JWT against that tenant's user pool with `aws-jwt-verify`;
-   - calls **STS AssumeRole** with an inline session policy. The policy restricts DynamoDB access to items whose partition key starts with the tenant's ID (`dynamodb:LeadingKeys = <tenantId>-*`);
-   - returns an IAM policy, a tenant context (`tenantId`, `userRole`, `userPoolId`, scoped credentials) and a `usageIdentifierKey`. API Gateway uses that key to pick the tenant's **usage plan**.
-4. Business Lambdas call DynamoDB with the **tenant-scoped credentials**, not their own execution role. A bug in application code therefore cannot read another tenant's rows.
+   - looks up tenant details (user pool, app client, API key, tier) in `ServerlessSaaS-TenantDetails` and rejects unknown or deactivated tenants;
+   - verifies the JWT against that tenant's user pool with `aws-jwt-verify`, and from then on uses only the verified claims;
+   - calls **STS AssumeRole** with an inline session policy. The policy restricts DynamoDB access to items whose partition key starts with the tenant's ID (`dynamodb:LeadingKeys = <tenantId>-*`). If this fails, the request is denied;
+   - returns an IAM policy, a tenant context (`tenantId`, `userRole`, tier, scoped credentials) and a `usageIdentifierKey`. The API's key source is `AUTHORIZER`, so API Gateway uses that key to pick the tenant's **usage plan**. Clients don't send an `x-api-key` header and can't choose another tier's plan.
+4. Business Lambdas call DynamoDB with the **tenant-scoped credentials**, not their own execution role, and there is no fallback to the execution role. A bug in application code therefore cannot read another tenant's rows; a request for another tenant's key fails in IAM and is answered with 404.
 
 The authorizer caches STS credentials (12 min of the 15 min session), tenant details (5 min) and JWT verifiers across warm invocations. This keeps the authorization overhead low.
 
@@ -63,25 +65,35 @@ Roles: `SystemAdmin` and `CustomerSupport` are SaaS provider operators. `TenantA
 
 ![Tenant onboarding flow](docs/images/tenant-onboarding.png)
 
-`POST /registration` does the following:
+`POST /registration` is public and runs these steps in one Lambda:
 
-1. Generates the tenant ID and resolves the tier's API key, or creates a per-tenant usage plan for PREMIUM.
-2. Creates the tenant admin user in Cognito (**User Management**).
+1. Generates the tenant ID and resolves the tier's API key from SSM, or creates a per-tenant usage plan for PREMIUM.
+2. Creates the tenant admin user in Cognito (**User Management**). Cognito emails them a temporary password.
 3. Stores tenant details (**Tenant Management**).
-4. Triggers **Tenant Provisioning**. This starts the tenant CodePipeline, which deploys a dedicated stack for siloed tenants.
+4. For PLATINUM, triggers **Tenant Provisioning**. This starts the tenant CodePipeline, which deploys the dedicated stack.
+
+If a step fails, the steps that already succeeded are rolled back in reverse order (usage plan and key, Cognito user, tenant record).
 
 The pipeline ([src/TenantPipeline](src/TenantPipeline)) is an AWS CDK app with three stages: **Source** from GitHub via a CodeStar connection, **Build** with `sam build` and `sam package` ([tenant-buildspec.yml](tenant-buildspec.yml)), and **Deploy**. In the Deploy stage, a Lambda creates or updates one CloudFormation stack per dedicated tenant and records it in `TenantStackMapping`.
 
 ## API overview
 
-| Area               | Endpoints |
-|--------------------|-----------|
-| Registration       | `POST /registration` (public) |
-| Tenant management  | `POST /tenant`, `GET /tenants`, `GET\|PUT\|DELETE /tenant/{tenantid}`, `PUT /tenant/activation/{tenantid}`, `GET /tenant/init/{tenantname}` |
-| User management    | `POST /user/tenant-admin`, `GET /users`, `PUT /users/disable` |
-| Provisioning       | `POST /provisioning`, `PUT /provisioning/{tenantid}` |
-| Products           | `GET /products`, `POST /product`, `GET\|PUT\|DELETE /product/{id}` |
-| Orders             | `GET /orders`, `POST /order`, `GET\|PUT\|DELETE /order/{id}` |
+All endpoints except registration require a Cognito JWT. Roles are checked in the handlers.
+
+| Endpoint | Who can call it |
+|---|---|
+| `POST /registration` | Public (throttled to 1 rps, burst 5) |
+| `GET /products`, `POST /product`, `GET\|PUT\|DELETE /product/{id}` | Any tenant user, own tenant's data only |
+| `GET /orders`, `POST /order`, `GET\|PUT\|DELETE /order/{id}` | Any tenant user, own tenant's data only |
+| `GET /tenant/{tenantid}` | Own tenant, or SaaS provider |
+| `PUT /tenant/{tenantid}` | Tenant admin (own tenant, contact details only), or system admin |
+| `GET /tenants` | SaaS provider (`SystemAdmin`, `CustomerSupport`) |
+| `POST /tenant`, `PUT /tenant/activation/{tenantid}`, `DELETE /tenant/{tenantid}` (deactivate) | System admin |
+| `GET /tenant/init/{tenantname}` | Any signed-in user |
+| `POST /user` | Tenant admin (creates `TenantUser`s in own tenant), or system admin |
+| `GET /users` | Tenant admin (own tenant), or SaaS provider (`?tenantId=`) |
+| `POST /user/tenant-admin`, `PUT /users/disable` | System admin |
+| `POST /provisioning`, `PUT /provisioning/{tenantid}` (deprovision) | System admin |
 
 ## Repository structure
 
@@ -92,13 +104,15 @@ The pipeline ([src/TenantPipeline](src/TenantPipeline)) is an AWS CDK app with t
 ├── samconfig.toml             # SAM deploy configuration (eu-central-1)
 ├── buildspec.yml              # CodeBuild spec for the main stack
 ├── tenant-buildspec.yml       # CodeBuild spec for tenant stacks
+├── .github/workflows/ci.yml  # Typecheck, unit tests, SAM template lint
 ├── src/
 │   ├── AuthService/           # Lambda authorizer (JWT validation, STS scoped credentials, usage-plan key)
 │   ├── TenantManagmentService/# Registration, tenant/user management, provisioning
 │   ├── ProductService/        # Tenant-aware product CRUD (handlers, service, DAL, tests)
 │   ├── OrderService/          # Tenant-aware order CRUD (handlers, service, DAL, tests)
 │   ├── TenantPipeline/        # CDK app: CodePipeline that deploys siloed tenant stacks
-│   └── shared/                # DynamoDB base repository, SSM helpers, tenant context utils
+│   ├── shared/                # Authorizer context and roles, scoped DynamoDB client, base repository
+│   └── tests-utils/           # Jest setup, DynamoDB mock, event builders
 ├── load-tests/                # k6 load tests, raw results, and Python chart generators
 └── docs/images/               # Architecture diagrams
 ```
@@ -121,7 +135,16 @@ sam build
 sam deploy --guided      # or `sam deploy` to use samconfig.toml
 ```
 
-The tier API keys are passed as `NoEcho` CloudFormation parameters (`PlatinumTierApiKey`, `PremiumTierApiKey`, `StandardTierApiKey`, `BasicTierApiKey`, `SystemAdminApiKey`) and have no defaults. Provide them at deploy time, for example in `sam deploy --guided` or with `--parameter-overrides`. Don't commit them to `samconfig.toml`.
+The tier API keys are passed as `NoEcho` CloudFormation parameters (`PlatinumTierApiKey`, `PremiumTierApiKey`, `StandardTierApiKey`, `BasicTierApiKey`, `SystemAdminApiKey`) and have no defaults. Provide them at deploy time, for example in `sam deploy --guided` or with `--parameter-overrides`. Don't commit them to `samconfig.toml`. The stack stores the tier keys in SSM (`/api-keys/<tier>`) for the registration function.
+
+SaaS provider operators are not created through the API. Create the first system admin in the pooled user pool; `custom:userRole` can only be set at creation:
+
+```bash
+aws cognito-idp admin-create-user \
+  --user-pool-id <PooledUserPoolId> \
+  --username admin \
+  --user-attributes Name=email,Value=<email> Name=email_verified,Value=true Name=custom:userRole,Value=SystemAdmin
+```
 
 ### Deploy the tenant pipeline
 
@@ -135,15 +158,19 @@ cdk deploy \
   --parameters GitHubBranch=main
 ```
 
-### Run unit tests
+### Run checks
 
 ```bash
-npm test
+npm run typecheck
+npm test                     # Jest unit tests (authorizer, role checks, registration rollback, DAL)
+sam validate --lint          # template lint
 ```
+
+The same checks run in CI on every push.
 
 ## Load testing and results
 
-The tests are in [load-tests/](load-tests) and use k6. Deployment-specific values (API URL, Cognito client ID, test user password, API keys, usage plan IDs) are read from `load-tests/.env`, which is gitignored. The test tenant IDs in the scripts match the results below; change them to match your own test tenants.
+The tests are in [load-tests/](load-tests) and use k6. Deployment-specific values (API URL, Cognito client ID, test user password, usage plan IDs) are read from `load-tests/.env`, which is gitignored. The test tenant IDs in the scripts match the results below; change them to match your own test tenants.
 
 ```bash
 cp load-tests/.env.example load-tests/.env   # then fill in your values
@@ -170,6 +197,25 @@ Each tier ran 75 requests with 0 % errors. Median latency is about 140–165 ms 
 ![Scenario 3](load-tests/scenario3_premium_premium.png)
 
 In all three scenarios the noisy tenant was throttled (HTTP 429) and the victim had no failed requests. Scenario 3 shows that two tenants of the **same** tier stay isolated because each PREMIUM tenant has its own usage plan.
+
+These results were measured before the security hardening described below. In that version clients sent the tier API key in the `x-api-key` header, and PLATINUM requests were served from the pooled tables. The usage plans and their limits are the same, so the throttling behaviour should hold, but the numbers have not been re-measured.
+
+## Security model and known limitations
+
+**Tenant isolation is enforced in three places:**
+
+1. **Identity.** `custom:tenantId` and `custom:userRole` are immutable Cognito attributes and are not writable through the app client, so users can't change their own tenant or role. Only the backend sets them, when it creates a user.
+2. **Authorization.** The authorizer accepts only verified tokens of active tenants, and every handler checks the caller's role and tenant.
+3. **Data access.** Business functions only get STS credentials whose session policy limits DynamoDB access to the caller's partition keys. If the credentials are missing, requests fail instead of falling back to the execution role.
+
+**Known limitations:**
+
+- **Dedicated compute isn't routed yet.** The PLATINUM stack deploys per-tenant Lambdas, but requests are still served by the pooled Lambdas, against the tenant's dedicated tables. Routing to the dedicated functions (for example with a per-tenant API) is future work.
+- **Registration is open.** Anyone can register a tenant, including PLATINUM, which starts a pipeline and a new stack. It's throttled, but a production system would need billing or approval first.
+- **Deactivation takes up to about 5 minutes.** The authorizer result and tenant details are cached for up to 5 minutes.
+- **Operators have cross-tenant access.** `SystemAdmin` and `CustomerSupport` get cross-tenant data access by design.
+- **The authorizer role trust is broad.** `authorizer-access-role` trusts the account root, so any principal in the account that is allowed `sts:AssumeRole` on it can use it.
+- **Listing users scans the pool.** `GET /users` reads the whole pooled user pool, because Cognito can't filter on custom attributes.
 
 ## Tech stack
 

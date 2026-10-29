@@ -1,7 +1,7 @@
 #!/bin/bash
 cd "$(dirname "$0")"
 
-# Deployment-specific values (API URL, Cognito client, test password, API keys,
+# Deployment-specific values (API URL, Cognito client, test password,
 # usage plan IDs) come from load-tests/.env. See .env.example.
 if [ -f .env ]; then
   set -a

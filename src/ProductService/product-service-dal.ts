@@ -2,16 +2,25 @@ import { BaseRepo } from "../shared/base-repo";
 import { parseKey, allShardsForTenant, shardForTenant } from "../shared/tenant";
 import { v4 as uuidv4 } from "uuid";
 import { Product, Category } from "./product-model";
-import { createScopedDdbClient, getTenantIdFromEvent } from "../shared/ddb";
+import {
+  createScopedDdbClient,
+  getTenantIdFromEvent,
+  tenantTableName,
+} from "../shared/ddb";
 
-const TABLE_NAME = process.env.PRODUCT_TABLE_NAME!;
+const POOLED_TABLE_NAME = process.env.PRODUCT_TABLE_NAME!;
 
-const repo = new BaseRepo<Product>(
-  TABLE_NAME,
-  { shardId: "shardId", id: "productId" },
-  (raw) => Product.fromItem(raw),
-  (p) => p.toItem(),
-);
+/**
+ * Repository for the caller's tenant: the pooled ProductTable, or
+ * Product-<tenantId> for dedicated (siloed) tenants.
+ */
+const repoFor = (event: any) =>
+  new BaseRepo<Product>(
+    tenantTableName(event, "Product", POOLED_TABLE_NAME),
+    { shardId: "shardId", id: "productId" },
+    (raw) => Product.fromItem(raw),
+    (p) => p.toItem(),
+  );
 
 /**
  * Get product by key using tenant-scoped credentials
@@ -19,7 +28,7 @@ const repo = new BaseRepo<Product>(
 export const getProduct = async (event: any, key: string) => {
   const client = createScopedDdbClient(event);
   const { shardId, id } = parseKey(key);
-  return repo.get({ shardId, productId: id }, client);
+  return repoFor(event).get({ shardId, productId: id }, client);
 };
 
 /**
@@ -27,9 +36,8 @@ export const getProduct = async (event: any, key: string) => {
  */
 export const getAllProducts = async (event: any) => {
   const client = createScopedDdbClient(event);
-  const tenantId = getTenantIdFromEvent(event);
-  // allShardsForTenant now correctly uses default (1, 11) to get shards 1-10
-  const shards = allShardsForTenant(tenantId);
+  const repo = repoFor(event);
+  const shards = allShardsForTenant(getTenantIdFromEvent(event));
 
   const results = await Promise.all(
     shards.map((s) => repo.queryByShard(s, client)),
@@ -43,7 +51,7 @@ export const getAllProducts = async (event: any) => {
 export const deleteProduct = async (event: any, key: string) => {
   const client = createScopedDdbClient(event);
   const { shardId, id } = parseKey(key);
-  return repo.delete({ shardId, productId: id }, client);
+  return repoFor(event).delete({ shardId, productId: id }, client);
 };
 
 /**
@@ -56,7 +64,7 @@ export const updateProduct = async (
 ) => {
   const client = createScopedDdbClient(event);
   const { shardId, id } = parseKey(key);
-  return repo.update(
+  return repoFor(event).update(
     { shardId, productId: id },
     {
       sku: payload.sku,
@@ -81,8 +89,7 @@ export const createProduct = async (
   },
 ) => {
   const client = createScopedDdbClient(event);
-  const tenantId = getTenantIdFromEvent(event);
-  const shardId = shardForTenant(tenantId);
+  const shardId = shardForTenant(getTenantIdFromEvent(event));
   const productId = uuidv4();
   const p = new Product(
     shardId,
@@ -92,5 +99,5 @@ export const createProduct = async (
     payload.price,
     new Category(payload.category.id, payload.category.name),
   );
-  return repo.put(p, client);
+  return repoFor(event).put(p, client);
 };

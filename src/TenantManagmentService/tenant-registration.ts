@@ -1,43 +1,42 @@
-import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import {
   APIGatewayClient,
   CreateApiKeyCommand,
   CreateUsagePlanCommand,
   CreateUsagePlanKeyCommand,
+  DeleteApiKeyCommand,
+  DeleteUsagePlanCommand,
+  UpdateUsagePlanCommand,
 } from "@aws-sdk/client-api-gateway";
 import { v4 as uuidv4 } from "uuid";
 import { Tenant, TenantTier } from "./tenant-model";
-import { ok, serverError } from "../shared/utils";
-import { APIGatewayProxyHandlerV2 } from "aws-lambda";
+import {
+  ok,
+  serverError,
+  badRequest,
+  parseBody,
+  isNonEmptyString,
+} from "../shared/utils";
+import { APIGatewayProxyHandler } from "aws-lambda";
 import { getParameter } from "../shared/ssm";
+import { createTenantAdmin, deleteTenantUser } from "./user-management";
+import { createTenantRecord, deleteTenantRecord } from "./tenant-management";
+import { startProvisioning } from "./tenant-provisioning";
 
-const {
-  CREATE_TENANT_ADMIN_USER_RESOURCE_PATH,
-  CREATE_TENANT_RESOURCE_PATH,
-  PROVISION_TENANT_RESOURCE_PATH,
-  AWS_REGION,
-  API_GATEWAY_ID,
-} = process.env;
-
-const paramByTier = {
+const paramByTier: Record<TenantTier, string> = {
   PLATINUM: "/api-keys/platinum",
   PREMIUM: "/api-keys/premium",
   STANDARD: "/api-keys/standard",
   BASIC: "/api-keys/basic",
-} as const;
+};
 
-const abs = (host: string, stage: string, path: string) =>
-  `https://${host}/${stage}${path}`;
-
-const client = new DynamoDBClient({ region: "eu-central-1" });
-const ddbDocClient = DynamoDBDocumentClient.from(client);
-const apiGwClient = new APIGatewayClient({ region: "eu-central-1" });
+const apiGwClient = new APIGatewayClient({});
 
 // Premium tier rate limits (per-tenant)
 const PREMIUM_RATE_LIMIT = 100;
 const PREMIUM_BURST_LIMIT = 200;
 const PREMIUM_DAILY_QUOTA = 5000;
+
+type Compensation = () => Promise<unknown>;
 
 /**
  * Creates a unique API key and Usage Plan for a PREMIUM tenant
@@ -47,6 +46,8 @@ async function createPremiumTenantUsagePlan(
   tenantId: string,
   tenantName: string,
   apiGatewayId: string,
+  stage: string,
+  compensations: Compensation[],
 ): Promise<string> {
   // Create unique API key for this tenant
   const apiKeyResponse = await apiGwClient.send(
@@ -57,21 +58,17 @@ async function createPremiumTenantUsagePlan(
       generateDistinctId: true,
     }),
   );
-
   const apiKeyId = apiKeyResponse.id!;
-  const apiKeyValue = apiKeyResponse.value!;
+  compensations.push(() =>
+    apiGwClient.send(new DeleteApiKeyCommand({ apiKey: apiKeyId })),
+  );
 
   // Create individual Usage Plan for this tenant
   const usagePlanResponse = await apiGwClient.send(
     new CreateUsagePlanCommand({
       name: `Plan_Premium_${tenantId}`,
       description: `Individual usage plan for Premium tenant: ${tenantName}`,
-      apiStages: [
-        {
-          apiId: apiGatewayId,
-          stage: "Prod",
-        },
-      ],
+      apiStages: [{ apiId: apiGatewayId, stage }],
       throttle: {
         rateLimit: PREMIUM_RATE_LIMIT,
         burstLimit: PREMIUM_BURST_LIMIT,
@@ -82,106 +79,116 @@ async function createPremiumTenantUsagePlan(
       },
     }),
   );
+  const usagePlanId = usagePlanResponse.id!;
+  // A usage plan can only be deleted after its API stage is detached
+  compensations.push(async () => {
+    await apiGwClient.send(
+      new UpdateUsagePlanCommand({
+        usagePlanId,
+        patchOperations: [
+          { op: "remove", path: "/apiStages", value: `${apiGatewayId}:${stage}` },
+        ],
+      }),
+    );
+    await apiGwClient.send(new DeleteUsagePlanCommand({ usagePlanId }));
+  });
 
   // Associate API key with Usage Plan
   await apiGwClient.send(
     new CreateUsagePlanKeyCommand({
-      usagePlanId: usagePlanResponse.id!,
+      usagePlanId,
       keyId: apiKeyId,
       keyType: "API_KEY",
     }),
   );
 
-  return apiKeyValue;
+  return apiKeyResponse.value!;
 }
 
-export const registerTenant: APIGatewayProxyHandlerV2 = async (event) => {
+/**
+ * Undo the completed steps of a failed registration, newest first.
+ */
+async function compensate(compensations: Compensation[]) {
+  for (const undo of compensations.reverse()) {
+    try {
+      await undo();
+    } catch (e) {
+      console.error("Registration rollback step failed:", e);
+    }
+  }
+}
+
+/**
+ * POST /registration (public): self-service tenant sign-up.
+ *
+ * Runs the onboarding steps in-process: tier API key (or a per-tenant
+ * usage plan for PREMIUM), tenant admin user, tenant record and, for
+ * PLATINUM, provisioning of the dedicated stack. If a step fails, the
+ * steps that already succeeded are rolled back.
+ */
+export const registerTenant: APIGatewayProxyHandler = async (event) => {
+  const body = parseBody(event);
+  if (!isNonEmptyString(body?.tenantName) || !isNonEmptyString(body?.tenantEmail)) {
+    return badRequest("tenantName and tenantEmail are required");
+  }
+
+  const tier = String(body.tenantTier || "BASIC").toUpperCase() as TenantTier;
+  if (!(tier in paramByTier)) {
+    return badRequest(`tenantTier must be one of ${Object.keys(paramByTier).join(", ")}`);
+  }
+
+  // Only PLATINUM gets dedicated tenancy (silo model)
+  // PREMIUM stays pooled but with per-tenant rate limiting
+  const dedicated = tier === "PLATINUM" ? "true" : "false";
+
+  // Generate unique tenant ID
+  const tenantId = `t-${uuidv4().split("-")[0]}`;
+  const compensations: Compensation[] = [];
+
   try {
-    const stage = event.requestContext.stage!;
-    const host = event.headers["host"] || event.headers["Host"]!;
-    const body = JSON.parse(event.body || "{}");
-
-    const tier = String(
-      body.tenantTier || "BASIC",
-    ).toUpperCase() as keyof typeof paramByTier;
-
-    // Only PLATINUM gets dedicated tenancy (silo model)
-    // PREMIUM stays pooled but with per-tenant rate limiting
-    const dedicated = tier === "PLATINUM" ? "true" : "false";
-
-    // Generate unique tenant ID
-    const tenantId = `t-${uuidv4().split("-")[0]}`;
-
     // For PREMIUM tier: create individual API key and Usage Plan
     // For other tiers: use shared tier API key
-    let apiKey: string;
-    if (tier === "PREMIUM") {
-      const apiGatewayId = API_GATEWAY_ID || event.requestContext.apiId;
-      apiKey = await createPremiumTenantUsagePlan(
-        tenantId,
-        body.tenantName,
-        apiGatewayId,
-      );
-    } else {
-      apiKey = await getParameter(paramByTier[tier], { decrypt: true });
-    }
+    const apiKey =
+      tier === "PREMIUM"
+        ? await createPremiumTenantUsagePlan(
+            tenantId,
+            body.tenantName,
+            event.requestContext.apiId,
+            event.requestContext.stage,
+            compensations,
+          )
+        : await getParameter(paramByTier[tier], { decrypt: true });
 
-    const base: Partial<Tenant> = {
-      tenantId: tenantId,
+    const admin = await createTenantAdmin(tenantId, body.tenantEmail);
+    compensations.push(() => deleteTenantUser(tenantId, admin.tenantAdminUserName));
+
+    const tenant: Tenant = {
+      tenantId,
       tenantName: body.tenantName,
       tenantAddress: body.tenantAddress,
       tenantEmail: body.tenantEmail,
       tenantPhone: body.tenantPhone,
       tenantTier: tier,
       dedicatedTenancy: dedicated,
-      apiKey: apiKey,
-    } as any;
-
-    // Get admin API key for internal service calls
-    const adminApiKey = await getParameter("/api-keys/admin", {
-      decrypt: true,
-    });
-
-    const createAdminRes = await fetch(
-      abs(host, stage, CREATE_TENANT_ADMIN_USER_RESOURCE_PATH!),
-      {
-        method: "POST",
-        body: JSON.stringify(base),
-        headers: {
-          "content-type": "application/json",
-          "x-api-key": adminApiKey,
-        },
-      },
-    ).then((r) => r.json());
-
-    const enriched = {
-      ...base,
-      userPoolId: createAdminRes?.message?.userPoolId,
-      appClientId: createAdminRes?.message?.appClientId,
-      tenantAdminUserName: createAdminRes?.message?.tenantAdminUserName,
+      apiKey,
+      userPoolId: admin.userPoolId,
+      appClientId: admin.appClientId,
+      isActive: true,
     };
-
-    await fetch(abs(host, stage, CREATE_TENANT_RESOURCE_PATH!), {
-      method: "POST",
-      body: JSON.stringify(enriched),
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": adminApiKey,
-      },
-    });
+    await createTenantRecord(tenant);
+    compensations.push(() => deleteTenantRecord(tenantId));
 
     if (dedicated === "true") {
-      await fetch(abs(host, stage, PROVISION_TENANT_RESOURCE_PATH!), {
-        method: "POST",
-        body: JSON.stringify(enriched),
-        headers: {
-          "content-type": "application/json",
-          "x-api-key": adminApiKey,
-        },
-      });
+      await startProvisioning(tenantId);
     }
-    return ok("You have been registered in our system");
+
+    return ok({
+      tenantId,
+      tenantAdminUserName: admin.tenantAdminUserName,
+      info: "A temporary password was sent to the tenant email",
+    });
   } catch (e) {
+    await compensate(compensations);
     return serverError(e);
   }
 };

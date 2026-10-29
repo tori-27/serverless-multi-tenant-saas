@@ -14,13 +14,3 @@ export interface Tenant {
   isActive: boolean;
   apiGatewayUrl?: string;
 }
-
-export interface AuthorizerCtx {
-  tenantId?: string;
-  userRole: "SystemAdmin" | "TenantAdmin" | "TenantUser";
-  userPoolId?: string;
-  userName?: string;
-  accesskey?: string;
-  secretkey?: string;
-  sessiontoken?: string;
-}

@@ -4,7 +4,7 @@
 
 cd "$(dirname "$0")"
 
-# Deployment-specific values (API URL, Cognito client, test password, API keys,
+# Deployment-specific values (API URL, Cognito client, test password,
 # usage plan IDs) come from load-tests/.env. See .env.example.
 if [ -f .env ]; then
   set -a
@@ -84,12 +84,10 @@ echo "Step 3: Warming up Lambda functions..."
 echo "------------------------------------------"
 echo "Sending single GET request per tier to wake up Lambdas..."
 
-# Warm up each tier sequentially
-for TIER_KEY in "$BASIC_API_KEY:$BASIC_TOKEN" "$STANDARD_API_KEY:$STANDARD_TOKEN" "$PREMIUM_API_KEY:$PREMIUM_TOKEN" "$PLATINUM_API_KEY:$PLATINUM_TOKEN"; do
-  API_KEY=$(echo "$TIER_KEY" | cut -d: -f1)
-  TOKEN=$(echo "$TIER_KEY" | cut -d: -f2-)
+# Warm up each tier sequentially. No x-api-key header: the authorizer
+# picks the tenant's usage plan.
+for TOKEN in "$BASIC_TOKEN" "$STANDARD_TOKEN" "$PREMIUM_TOKEN" "$PLATINUM_TOKEN"; do
   STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-    -H "x-api-key: $API_KEY" \
     -H "Authorization: Bearer $TOKEN" \
     "$BASE_URL/products")
   echo "  Warm-up GET /products: HTTP $STATUS"
@@ -101,7 +99,6 @@ echo ""
 echo "Verifying POST /product works..."
 POST_RESULT=$(curl -s -w "\n%{http_code}" \
   -X POST "$BASE_URL/product" \
-  -H "x-api-key: $BASIC_API_KEY" \
   -H "Authorization: Bearer $BASIC_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"sku":"WARMUP-TEST","name":"Warmup","price":1,"category":{"id":"cat-1","name":"Test"}}')

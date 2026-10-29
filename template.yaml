@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  diplom-sam-app — Orders, Products, TenantManagement (TS)
+  Serverless multi-tenant SaaS: shared (pooled) infrastructure, tenant
+  management, authorizer and usage plans
 
 Globals:
   Function:
@@ -9,23 +10,6 @@ Globals:
     Runtime: nodejs22.x
     Tracing: Active
     LoggingConfig: { LogFormat: JSON }
-  Api:
-    TracingEnabled: true
-    Cors:
-      AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
-      AllowHeaders: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
-      AllowOrigin: "'*'"
-    Auth:
-      DefaultAuthorizer: TenantLambdaAuthorizer
-      ApiKeyRequired: true
-      Authorizers:
-        TenantLambdaAuthorizer:
-          FunctionArn: !GetAtt AuthorizerFunction.Arn
-          FunctionPayloadType: TOKEN
-          Identity:
-            Header: Authorization
-            ValidationExpression: "^Bearer .+$"
-            ReauthorizeEvery: 300
 
 Parameters:
   PlatinumTierApiKey:
@@ -45,6 +29,41 @@ Parameters:
     NoEcho: true
 
 Resources:
+  ########################
+  # API Gateway
+  ########################
+  TenantApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      TracingEnabled: true
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization,X-Amz-Date,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: TenantLambdaAuthorizer
+        ApiKeyRequired: true
+        Authorizers:
+          TenantLambdaAuthorizer:
+            FunctionArn: !GetAtt AuthorizerFunction.Arn
+            FunctionPayloadType: TOKEN
+            Identity:
+              Header: Authorization
+              ValidationExpression: "^Bearer .+$"
+              ReauthorizeEvery: 300
+      # Usage plans are picked by the key the authorizer returns
+      # (usageIdentifierKey), so clients can't choose a plan by sending
+      # another tier's x-api-key header.
+      ApiKeySourceType: AUTHORIZER
+      MethodSettings:
+        # Public self-registration creates users and, for PLATINUM, whole
+        # stacks; throttle it hard.
+        - ResourcePath: "/~1registration"
+          HttpMethod: POST
+          ThrottlingRateLimit: 1
+          ThrottlingBurstLimit: 5
+
   ########################
   # DynamoDB (orders/products)
   ########################
@@ -148,8 +167,10 @@ Resources:
             Required: true,
             Mutable: true,
           }
-        - { Name: tenantId, AttributeDataType: String, Mutable: true }
-        - { Name: userRole, AttributeDataType: String, Mutable: true }
+        # Immutable, and not in the client's WriteAttributes: only the
+        # backend sets them, at user creation
+        - { Name: tenantId, AttributeDataType: String, Mutable: false }
+        - { Name: userRole, AttributeDataType: String, Mutable: false }
 
   PooledUserPoolClient:
     Type: AWS::Cognito::UserPoolClient
@@ -158,6 +179,15 @@ Resources:
       GenerateSecret: false
       UserPoolId: !Ref PooledUserPool
       AllowedOAuthFlowsUserPoolClient: false
+      # Without WriteAttributes, users could call UpdateUserAttributes and
+      # rewrite custom:tenantId / custom:userRole in their own tokens
+      ReadAttributes: [email, email_verified, custom:tenantId, custom:userRole]
+      WriteAttributes: [email]
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH # used by the load-test scripts
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
 
   ########################
   # Orders — Lambdas & API
@@ -170,7 +200,7 @@ Resources:
       Events:
         {
           ApiGet:
-            { Type: Api, Properties: { Path: "/order/{id}", Method: get } },
+            { Type: Api, Properties: { RestApiId: !Ref TenantApi, Path: "/order/{id}", Method: get } },
         }
       Environment: { Variables: { ORDER_TABLE_NAME: !Ref OrderTable } }
       Policies:
@@ -195,7 +225,7 @@ Resources:
       Events:
         {
           ApiDel:
-            { Type: Api, Properties: { Path: "/order/{id}", Method: delete } },
+            { Type: Api, Properties: { RestApiId: !Ref TenantApi, Path: "/order/{id}", Method: delete } },
         }
       Environment: { Variables: { ORDER_TABLE_NAME: !Ref OrderTable } }
       Policies:
@@ -220,7 +250,7 @@ Resources:
       Events:
         {
           ApiPut:
-            { Type: Api, Properties: { Path: "/order/{id}", Method: put } },
+            { Type: Api, Properties: { RestApiId: !Ref TenantApi, Path: "/order/{id}", Method: put } },
         }
       Environment: { Variables: { ORDER_TABLE_NAME: !Ref OrderTable } }
       Policies:
@@ -243,7 +273,7 @@ Resources:
       CodeUri: src/OrderService
       Handler: handlers.createOrderHandler
       Events:
-        { ApiPost: { Type: Api, Properties: { Path: /order, Method: post } } }
+        { ApiPost: { Type: Api, Properties: { RestApiId: !Ref TenantApi, Path: /order, Method: post } } }
       Environment: { Variables: { ORDER_TABLE_NAME: !Ref OrderTable } }
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref OrderTable }
@@ -265,7 +295,7 @@ Resources:
       CodeUri: src/OrderService
       Handler: handlers.getAllOrdersHandler
       Events:
-        { ApiGetAll: { Type: Api, Properties: { Path: /orders, Method: get } } }
+        { ApiGetAll: { Type: Api, Properties: { RestApiId: !Ref TenantApi, Path: /orders, Method: get } } }
       Environment: { Variables: { ORDER_TABLE_NAME: !Ref OrderTable } }
       Policies:
         - DynamoDBReadPolicy: { TableName: !Ref OrderTable }
@@ -292,7 +322,7 @@ Resources:
       Events:
         {
           ApiGet:
-            { Type: Api, Properties: { Path: "/product/{id}", Method: get } },
+            { Type: Api, Properties: { RestApiId: !Ref TenantApi, Path: "/product/{id}", Method: get } },
         }
       Environment: { Variables: { PRODUCT_TABLE_NAME: !Ref ProductTable } }
       Policies:
@@ -319,7 +349,7 @@ Resources:
           ApiDel:
             {
               Type: Api,
-              Properties: { Path: "/product/{id}", Method: delete },
+              Properties: { RestApiId: !Ref TenantApi, Path: "/product/{id}", Method: delete },
             },
         }
       Environment: { Variables: { PRODUCT_TABLE_NAME: !Ref ProductTable } }
@@ -345,7 +375,7 @@ Resources:
       Events:
         {
           ApiPut:
-            { Type: Api, Properties: { Path: "/product/{id}", Method: put } },
+            { Type: Api, Properties: { RestApiId: !Ref TenantApi, Path: "/product/{id}", Method: put } },
         }
       Environment: { Variables: { PRODUCT_TABLE_NAME: !Ref ProductTable } }
       Policies:
@@ -368,7 +398,7 @@ Resources:
       CodeUri: src/ProductService
       Handler: handlers.createProductHandler
       Events:
-        { ApiPost: { Type: Api, Properties: { Path: /product, Method: post } } }
+        { ApiPost: { Type: Api, Properties: { RestApiId: !Ref TenantApi, Path: /product, Method: post } } }
       Environment: { Variables: { PRODUCT_TABLE_NAME: !Ref ProductTable } }
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref ProductTable }
@@ -392,7 +422,7 @@ Resources:
       Events:
         {
           ApiGetAll:
-            { Type: Api, Properties: { Path: /products, Method: get } },
+            { Type: Api, Properties: { RestApiId: !Ref TenantApi, Path: /products, Method: get } },
         }
       Environment: { Variables: { PRODUCT_TABLE_NAME: !Ref ProductTable } }
       Policies:
@@ -425,7 +455,7 @@ Resources:
             {
               Type: Api,
               Properties:
-                { Path: /tenant, Method: post, Auth: { Authorizer: NONE } },
+                { RestApiId: !Ref TenantApi, Path: /tenant, Method: post },
             },
         }
       Environment:
@@ -454,7 +484,7 @@ Resources:
       Handler: tenant-management.getTenants
       Events:
         {
-          ApiGetAll: { Type: Api, Properties: { Path: /tenants, Method: get } },
+          ApiGetAll: { Type: Api, Properties: { RestApiId: !Ref TenantApi, Path: /tenants, Method: get } },
         }
       Environment:
         {
@@ -488,7 +518,7 @@ Resources:
           ApiPut:
             {
               Type: Api,
-              Properties: { Path: "/tenant/{tenantid}", Method: put },
+              Properties: { RestApiId: !Ref TenantApi, Path: "/tenant/{tenantid}", Method: put },
             },
         }
       Environment:
@@ -523,7 +553,7 @@ Resources:
           ApiGet:
             {
               Type: Api,
-              Properties: { Path: "/tenant/{tenantid}", Method: get },
+              Properties: { RestApiId: !Ref TenantApi, Path: "/tenant/{tenantid}", Method: get },
             },
         }
       Environment:
@@ -559,7 +589,7 @@ Resources:
             {
               Type: Api,
               Properties:
-                { Path: "/tenant/activation/{tenantid}", Method: put },
+                { RestApiId: !Ref TenantApi, Path: "/tenant/activation/{tenantid}", Method: put },
             },
         }
       Environment:
@@ -594,7 +624,7 @@ Resources:
           ApiDel:
             {
               Type: Api,
-              Properties: { Path: "/tenant/{tenantid}", Method: delete },
+              Properties: { RestApiId: !Ref TenantApi, Path: "/tenant/{tenantid}", Method: delete },
             },
         }
       Environment:
@@ -629,7 +659,7 @@ Resources:
           ApiGet:
             {
               Type: Api,
-              Properties: { Path: "/tenant/init/{tenantname}", Method: get },
+              Properties: { RestApiId: !Ref TenantApi, Path: "/tenant/init/{tenantname}", Method: get },
             },
         }
       Environment:
@@ -666,21 +696,40 @@ Resources:
             {
               Type: Api,
               Properties:
-                {
+                { RestApiId: !Ref TenantApi,
                   Path: /registration,
                   Method: post,
-                  Auth: { Authorizer: NONE },
+                  Auth: { Authorizer: NONE, ApiKeyRequired: false },
                 },
             },
         }
+      Timeout: 30
       Environment:
         Variables:
-          CREATE_TENANT_ADMIN_USER_RESOURCE_PATH: "/user/tenant-admin"
-          CREATE_TENANT_RESOURCE_PATH: "/tenant"
-          PROVISION_TENANT_RESOURCE_PATH: "/provisioning"
+          TENANT_USER_POOL_ID: !Ref PooledUserPool
+          TENANT_APP_CLIENT_ID: !Ref PooledUserPoolClient
+          TABLE_TENANT_DETAILS: !Ref TenantDetailsTable
+          TABLE_SETTINGS: !Ref SettingsTable
+          TABLE_TENANT_USER_MAPPING: !Ref TenantUserMappingTable
+          TENANT_STACK_MAPPING_TABLE_NAME: !Ref TenantStackMappingTable
+          PIPELINE_NAME: serverless-saas-pipeline
       Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TenantDetailsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref SettingsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref TenantUserMappingTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref TenantStackMappingTable }
         - Version: "2012-10-17"
           Statement:
+            - Sid: ManageTenantUsers
+              Effect: Allow
+              Action:
+                - cognito-idp:AdminCreateUser
+                - cognito-idp:AdminDeleteUser
+              Resource: !GetAtt PooledUserPool.Arn
+            - Sid: StartTenantPipeline
+              Effect: Allow
+              Action: codepipeline:StartPipelineExecution
+              Resource: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:serverless-saas-pipeline
             - Sid: ReadApiKeysFromSsm
               Effect: Allow
               Action:
@@ -695,6 +744,8 @@ Resources:
                 - apigateway:POST
                 - apigateway:GET
                 - apigateway:PUT
+                - apigateway:PATCH
+                - apigateway:DELETE
               Resource:
                 - !Sub arn:aws:apigateway:${AWS::Region}::/apikeys
                 - !Sub arn:aws:apigateway:${AWS::Region}::/apikeys/*
@@ -725,10 +776,9 @@ Resources:
             {
               Type: Api,
               Properties:
-                {
+                { RestApiId: !Ref TenantApi,
                   Path: /user/tenant-admin,
                   Method: post,
-                  Auth: { Authorizer: NONE },
                 },
             },
         }
@@ -739,12 +789,44 @@ Resources:
           TABLE_TENANT_USER_MAPPING: !Ref TenantUserMappingTable
           TABLE_TENANT_DETAILS: !Ref TenantDetailsTable
       Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TenantUserMappingTable }
         - Statement:
             - Effect: Allow
               Action:
                 - cognito-idp:AdminCreateUser
-                - cognito-idp:AdminAddUserToGroup
-              Resource: "*"
+              Resource: !GetAtt PooledUserPool.Arn
+    Metadata:
+      {
+        BuildMethod: esbuild,
+        BuildProperties:
+          {
+            Minify: true,
+            Target: es2020,
+            Sourcemap: true,
+            EntryPoints: [user-management.ts],
+          },
+      }
+
+  CreateTenantUserFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/TenantManagmentService
+      Handler: user-management.createTenantUser
+      Events:
+        {
+          ApiPost:
+            { Type: Api, Properties: { RestApiId: !Ref TenantApi, Path: /user, Method: post } },
+        }
+      Environment:
+        Variables:
+          TENANT_USER_POOL_ID: !Ref PooledUserPool
+          TABLE_TENANT_USER_MAPPING: !Ref TenantUserMappingTable
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TenantUserMappingTable }
+        - Statement:
+            - Effect: Allow
+              Action: [cognito-idp:AdminCreateUser]
+              Resource: !GetAtt PooledUserPool.Arn
     Metadata:
       {
         BuildMethod: esbuild,
@@ -763,7 +845,7 @@ Resources:
       CodeUri: src/TenantManagmentService
       Handler: user-management.getUsers
       Events:
-        { ApiGet: { Type: Api, Properties: { Path: /users, Method: get } } }
+        { ApiGet: { Type: Api, Properties: { RestApiId: !Ref TenantApi, Path: /users, Method: get } } }
       Environment:
         Variables:
           TENANT_USER_POOL_ID: !Ref PooledUserPool
@@ -771,7 +853,7 @@ Resources:
         - Statement:
             - Effect: Allow
               Action: [cognito-idp:ListUsers]
-              Resource: "*"
+              Resource: !GetAtt PooledUserPool.Arn
     Metadata:
       {
         BuildMethod: esbuild,
@@ -792,17 +874,18 @@ Resources:
       Events:
         {
           ApiPut:
-            { Type: Api, Properties: { Path: /users/disable, Method: put } },
+            { Type: Api, Properties: { RestApiId: !Ref TenantApi, Path: /users/disable, Method: put } },
         }
       Environment:
         Variables:
+          TENANT_USER_POOL_ID: !Ref PooledUserPool
           TABLE_TENANT_USER_MAPPING: !Ref TenantUserMappingTable
       Policies:
         - DynamoDBReadPolicy: { TableName: !Ref TenantUserMappingTable }
         - Statement:
             - Effect: Allow
               Action: [cognito-idp:AdminDisableUser]
-              Resource: "*"
+              Resource: !GetAtt PooledUserPool.Arn
     Metadata:
       {
         BuildMethod: esbuild,
@@ -824,25 +907,21 @@ Resources:
         ApiPost:
           Type: Api
           Properties:
+            RestApiId: !Ref TenantApi
             Path: /provisioning
             Method: post
-            Auth:
-              Authorizer: NONE
       Environment:
         Variables:
           TENANT_STACK_MAPPING_TABLE_NAME: !Ref TenantStackMappingTable
           PIPELINE_NAME: "serverless-saas-pipeline"
       Policies:
-        # доступ до DynamoDB таблиці TenantStackMapping
         - DynamoDBCrudPolicy:
             TableName: !Ref TenantStackMappingTable
-
-        # дозвіл стартувати CodePipeline
         - Statement:
             - Effect: Allow
               Action:
                 - codepipeline:StartPipelineExecution
-              Resource: "*" # можна потім звузити до конкретного пайплайна
+              Resource: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:serverless-saas-pipeline
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
@@ -860,6 +939,7 @@ Resources:
         ApiPut:
           Type: Api
           Properties:
+            RestApiId: !Ref TenantApi
             Path: /provisioning/{tenantid}
             Method: put
       Environment:
@@ -868,11 +948,34 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref TenantStackMappingTable
+        # CloudFormation deletes the tenant stack with this function's
+        # permissions, so it also needs to delete the stack's resources.
+        # Everything is limited to tenant-named resources (t-*).
         - Statement:
             - Effect: Allow
               Action:
                 - cloudformation:DeleteStack
-              Resource: "*" # можеш звузити до arn стека кожного тенанта
+                - cloudformation:DescribeStacks
+              Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/stack-t-*/*
+            - Effect: Allow
+              Action:
+                - dynamodb:DeleteTable
+                - dynamodb:DescribeTable
+              Resource:
+                - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/Product-t-*
+                - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/Order-t-*
+            - Effect: Allow
+              Action:
+                - lambda:DeleteFunction
+                - lambda:GetFunction
+              Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:t-*
+            - Effect: Allow
+              Action:
+                - iam:DeleteRole
+                - iam:DeleteRolePolicy
+                - iam:DetachRolePolicy
+                - iam:GetRole
+              Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/t-*
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
@@ -1005,17 +1108,43 @@ Resources:
       Enabled: true
       Value: !Ref SystemAdminApiKey
 
+  # Tier keys read by tenant registration (/api-keys/<tier>)
+  ApiKeyParamPlatinum:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /api-keys/platinum
+      Type: String
+      Value: !Ref PlatinumTierApiKey
+  ApiKeyParamPremium:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /api-keys/premium
+      Type: String
+      Value: !Ref PremiumTierApiKey
+  ApiKeyParamStandard:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /api-keys/standard
+      Type: String
+      Value: !Ref StandardTierApiKey
+  ApiKeyParamBasic:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /api-keys/basic
+      Type: String
+      Value: !Ref BasicTierApiKey
+
   ########################
   # Usage Plans
   ########################
   UsagePlanPlatinumTier:
     Type: AWS::ApiGateway::UsagePlan
-    DependsOn: ServerlessRestApiProdStage
+    DependsOn: TenantApiProdStage
     Properties:
       UsagePlanName: Plan_Platinum_Tier
       Description: Usage plan for Platinum tier tenants - highest limits
       ApiStages:
-        - ApiId: !Ref ServerlessRestApi
+        - ApiId: !Ref TenantApi
           Stage: Prod
       Quota:
         Limit: 10000
@@ -1026,12 +1155,12 @@ Resources:
 
   UsagePlanPremiumTier:
     Type: AWS::ApiGateway::UsagePlan
-    DependsOn: ServerlessRestApiProdStage
+    DependsOn: TenantApiProdStage
     Properties:
       UsagePlanName: Plan_Premium_Tier
       Description: Usage plan for Premium tier tenants
       ApiStages:
-        - ApiId: !Ref ServerlessRestApi
+        - ApiId: !Ref TenantApi
           Stage: Prod
       Quota:
         Limit: 5000
@@ -1042,12 +1171,12 @@ Resources:
 
   UsagePlanStandardTier:
     Type: AWS::ApiGateway::UsagePlan
-    DependsOn: ServerlessRestApiProdStage
+    DependsOn: TenantApiProdStage
     Properties:
       UsagePlanName: Plan_Standard_Tier
       Description: Usage plan for Standard tier tenants
       ApiStages:
-        - ApiId: !Ref ServerlessRestApi
+        - ApiId: !Ref TenantApi
           Stage: Prod
       Quota:
         Limit: 3000
@@ -1058,12 +1187,12 @@ Resources:
 
   UsagePlanBasicTier:
     Type: AWS::ApiGateway::UsagePlan
-    DependsOn: ServerlessRestApiProdStage
+    DependsOn: TenantApiProdStage
     Properties:
       UsagePlanName: Plan_Basic_Tier
       Description: Usage plan for Basic tier tenants - lowest limits
       ApiStages:
-        - ApiId: !Ref ServerlessRestApi
+        - ApiId: !Ref TenantApi
           Stage: Prod
       Quota:
         Limit: 500
@@ -1074,12 +1203,12 @@ Resources:
 
   UsagePlanSystemAdmin:
     Type: AWS::ApiGateway::UsagePlan
-    DependsOn: ServerlessRestApiProdStage
+    DependsOn: TenantApiProdStage
     Properties:
       UsagePlanName: Plan_System_Admin
       Description: Usage plan for System Administrators
       ApiStages:
-        - ApiId: !Ref ServerlessRestApi
+        - ApiId: !Ref TenantApi
           Stage: Prod
       Quota:
         Limit: 50000
@@ -1128,7 +1257,7 @@ Resources:
 
 Outputs:
   ApiBaseUrl:
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+    Value: !Sub "https://${TenantApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
   SettingsTableName:
     Value: !Ref SettingsTable
   TenantDetailsTableName:

@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
   Serverless SaaS - Silo Tenant Stack (TypeScript)
-  This template deploys isolated resources for a single premium/platinum tenant.
+  This template deploys isolated resources for a single dedicated (PLATINUM) tenant.
 
 Globals:
   Function:
@@ -140,7 +140,6 @@ Resources:
   ########################
   GetProductFunction:
     Type: AWS::Serverless::Function
-    DependsOn: ProductFunctionExecutionRole
     Properties:
       FunctionName: !Join ["-", [!Ref TenantIdParameter, "GetProduct"]]
       CodeUri: src/ProductService
@@ -163,7 +162,6 @@ Resources:
 
   GetProductsFunction:
     Type: AWS::Serverless::Function
-    DependsOn: ProductFunctionExecutionRole
     Properties:
       FunctionName: !Join ["-", [!Ref TenantIdParameter, "GetProducts"]]
       CodeUri: src/ProductService
@@ -186,7 +184,6 @@ Resources:
 
   CreateProductFunction:
     Type: AWS::Serverless::Function
-    DependsOn: ProductFunctionExecutionRole
     Properties:
       FunctionName: !Join ["-", [!Ref TenantIdParameter, "CreateProduct"]]
       CodeUri: src/ProductService
@@ -209,7 +206,6 @@ Resources:
 
   UpdateProductFunction:
     Type: AWS::Serverless::Function
-    DependsOn: ProductFunctionExecutionRole
     Properties:
       FunctionName: !Join ["-", [!Ref TenantIdParameter, "UpdateProduct"]]
       CodeUri: src/ProductService
@@ -232,7 +228,6 @@ Resources:
 
   DeleteProductFunction:
     Type: AWS::Serverless::Function
-    DependsOn: ProductFunctionExecutionRole
     Properties:
       FunctionName: !Join ["-", [!Ref TenantIdParameter, "DeleteProduct"]]
       CodeUri: src/ProductService
@@ -258,7 +253,6 @@ Resources:
   ########################
   GetOrderFunction:
     Type: AWS::Serverless::Function
-    DependsOn: OrderFunctionExecutionRole
     Properties:
       FunctionName: !Join ["-", [!Ref TenantIdParameter, "GetOrder"]]
       CodeUri: src/OrderService
@@ -281,7 +275,6 @@ Resources:
 
   GetOrdersFunction:
     Type: AWS::Serverless::Function
-    DependsOn: OrderFunctionExecutionRole
     Properties:
       FunctionName: !Join ["-", [!Ref TenantIdParameter, "GetOrders"]]
       CodeUri: src/OrderService
@@ -304,7 +297,6 @@ Resources:
 
   CreateOrderFunction:
     Type: AWS::Serverless::Function
-    DependsOn: OrderFunctionExecutionRole
     Properties:
       FunctionName: !Join ["-", [!Ref TenantIdParameter, "CreateOrder"]]
       CodeUri: src/OrderService
@@ -327,7 +319,6 @@ Resources:
 
   UpdateOrderFunction:
     Type: AWS::Serverless::Function
-    DependsOn: OrderFunctionExecutionRole
     Properties:
       FunctionName: !Join ["-", [!Ref TenantIdParameter, "UpdateOrder"]]
       CodeUri: src/OrderService
@@ -350,7 +341,6 @@ Resources:
 
   DeleteOrderFunction:
     Type: AWS::Serverless::Function
-    DependsOn: OrderFunctionExecutionRole
     Properties:
       FunctionName: !Join ["-", [!Ref TenantIdParameter, "DeleteOrder"]]
       CodeUri: src/OrderService

@@ -1,7 +1,6 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
-
-const region = process.env.AWS_REGION || "eu-central-1";
+import { getAuthorizerContext } from "./auth";
 
 const marshallOptions = {
   convertEmptyValues: false,
@@ -11,84 +10,52 @@ const marshallOptions = {
 const unmarshallOptions = { wrapNumbers: false };
 
 /**
- * Default DynamoDB client (uses Lambda's IAM role)
+ * Default DynamoDB client (uses the Lambda's own IAM role). Only for
+ * control-plane tables such as tenant details, never for tenant data.
  */
-export const ddbDocClient = DynamoDBDocumentClient.from(
-  new DynamoDBClient({ region }),
-  { marshallOptions, unmarshallOptions }
-);
+export const ddbDocClient = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
+  marshallOptions,
+  unmarshallOptions,
+});
 
 /**
- * Authorizer context with STS credentials
- */
-export interface AuthorizerContext {
-  tenantId: string;
-  userRole: string;
-  userName: string;
-  userPoolId: string;
-  apiKey: string;
-  accessKeyId?: string;
-  secretAccessKey?: string;
-  sessionToken?: string;
-}
-
-/**
- * Extract authorizer context from Lambda event
- */
-export function getAuthorizerContext(event: any): AuthorizerContext {
-  const ctx = event?.requestContext?.authorizer || {};
-  return {
-    tenantId: ctx.tenantId || process.env.DEFAULT_TENANT_ID || "devtenant",
-    userRole: ctx.userRole || "TenantUser",
-    userName: ctx.userName || "unknown",
-    userPoolId: ctx.userPoolId || "",
-    apiKey: ctx.apiKey || "",
-    accessKeyId: ctx.accessKeyId,
-    secretAccessKey: ctx.secretAccessKey,
-    sessionToken: ctx.sessionToken,
-  };
-}
-
-/**
- * Check if we have STS credentials from authorizer
- */
-export function hasStsCredentials(ctx: AuthorizerContext): boolean {
-  return !!(ctx.accessKeyId && ctx.secretAccessKey && ctx.sessionToken);
-}
-
-/**
- * Create DynamoDB client with STS credentials from authorizer
- * This ensures tenant isolation via IAM policy with LeadingKeys condition
+ * Create a DynamoDB client with the tenant-scoped STS credentials issued by
+ * the authorizer. The session policy limits access to items whose partition
+ * key starts with the tenant ID (dynamodb:LeadingKeys).
+ *
+ * Fails closed: without scoped credentials there is no fallback to the
+ * function's own role, because that role is not tenant-scoped.
  */
 export function createScopedDdbClient(event: any): DynamoDBDocumentClient {
   const ctx = getAuthorizerContext(event);
 
-  if (hasStsCredentials(ctx)) {
-    // Use STS credentials for tenant isolation
-    const scopedClient = new DynamoDBClient({
-      region,
-      credentials: {
-        accessKeyId: ctx.accessKeyId!,
-        secretAccessKey: ctx.secretAccessKey!,
-        sessionToken: ctx.sessionToken!,
-      },
-    });
-    return DynamoDBDocumentClient.from(scopedClient, {
-      marshallOptions,
-      unmarshallOptions,
-    });
+  if (!ctx.accessKeyId || !ctx.secretAccessKey || !ctx.sessionToken) {
+    throw new Error("Missing tenant-scoped credentials");
   }
 
-  // Fallback to default client (for local development or internal calls)
-  console.warn(
-    "No STS credentials in authorizer context, using default client"
-  );
-  return ddbDocClient;
+  const scopedClient = new DynamoDBClient({
+    credentials: {
+      accessKeyId: ctx.accessKeyId,
+      secretAccessKey: ctx.secretAccessKey,
+      sessionToken: ctx.sessionToken,
+    },
+  });
+  return DynamoDBDocumentClient.from(scopedClient, {
+    marshallOptions,
+    unmarshallOptions,
+  });
 }
 
 /**
- * Get tenant ID from event
+ * Resolve the table for a tenant: dedicated (siloed) tenants have their own
+ * `<prefix>-<tenantId>` table from tenant-template.yaml, pooled tenants share
+ * the table from the given environment variable.
  */
+export function tenantTableName(event: any, prefix: string, pooledTable: string) {
+  const ctx = getAuthorizerContext(event);
+  return ctx.dedicatedTenancy === "true" ? `${prefix}-${ctx.tenantId}` : pooledTable;
+}
+
 export function getTenantIdFromEvent(event: any): string {
   return getAuthorizerContext(event).tenantId;
 }

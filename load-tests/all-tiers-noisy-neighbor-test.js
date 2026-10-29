@@ -16,7 +16,8 @@ import { Counter, Rate, Trend } from "k6/metrics";
  * - Scenario 3: Each PREMIUM tenant isolated (per-tenant usage plans)
  */
 
-// API URL and API keys come from environment variables (see .env.example)
+// API URL comes from an environment variable (see .env.example). No
+// x-api-key header: the authorizer selects the tenant's usage plan.
 const BASE_URL = __ENV.BASE_URL;
 
 // JWT tokens from environment variables
@@ -33,7 +34,6 @@ const TENANTS = {
     name: "BasicCorp",
     tenantId: "t-cc327c5c",
     tier: "BASIC",
-    apiKey: __ENV.BASIC_API_KEY,
     jwtToken: BASIC_JWT,
     rateLimit: 10, // LOW: shared tier limit for testing
   },
@@ -42,7 +42,6 @@ const TENANTS = {
     name: "TestStandardCorp",
     tenantId: "t-9a72f0b8",
     tier: "STANDARD",
-    apiKey: __ENV.STANDARD_API_KEY,
     jwtToken: STANDARD_JWT,
     rateLimit: 15, // LOW: shared tier limit for testing
   },
@@ -51,7 +50,6 @@ const TENANTS = {
     name: "qwerty Corp",
     tenantId: "t-cad5c200",
     tier: "PLATINUM",
-    apiKey: __ENV.PLATINUM_API_KEY,
     jwtToken: PLATINUM_JWT,
     rateLimit: 50, // LOW: dedicated limit for testing
   },
@@ -60,7 +58,6 @@ const TENANTS = {
     name: "PremiumNoisy",
     tenantId: "t-d1cb8ca4",
     tier: "PREMIUM",
-    apiKey: __ENV.PREMIUM_NOISY_API_KEY,
     jwtToken: PREMIUM_NOISY_JWT,
     rateLimit: 20, // LOW: per-tenant limit for testing
   },
@@ -68,7 +65,6 @@ const TENANTS = {
     name: "PremiumCorp",
     tenantId: "t-46d6c4c8",
     tier: "PREMIUM",
-    apiKey: __ENV.PREMIUM_API_KEY,
     jwtToken: PREMIUM_VICTIM_JWT,
     rateLimit: 20, // LOW: per-tenant limit for testing
   },
@@ -185,7 +181,6 @@ function makeRequest(
   const url = `${BASE_URL}/products`;
   const params = {
     headers: {
-      "x-api-key": tenant.apiKey,
       Authorization: `Bearer ${tenant.jwtToken}`,
       "Content-Type": "application/json",
     },

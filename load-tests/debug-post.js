@@ -1,12 +1,12 @@
 import http from "k6/http";
 
-// API URL and API keys come from environment variables (see .env.example)
+// API URL comes from an environment variable (see .env.example). No
+// x-api-key header: the authorizer selects the tenant's usage plan.
 const BASE_URL = __ENV.BASE_URL;
 const BASIC_JWT = __ENV.BASIC_TOKEN || "";
 
 export default function () {
   const headers = {
-    "x-api-key": __ENV.BASIC_API_KEY,
     Authorization: `Bearer ${BASIC_JWT}`,
     "Content-Type": "application/json",
   };

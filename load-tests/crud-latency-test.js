@@ -15,7 +15,8 @@ import { Trend, Counter, Rate } from "k6/metrics";
  * Purpose: Measure p50, p95, p99 latency for each operation across tiers
  */
 
-// API URL and API keys come from environment variables (see .env.example)
+// API URL comes from an environment variable (see .env.example). No
+// x-api-key header: the authorizer selects the tenant's usage plan.
 const BASE_URL = __ENV.BASE_URL;
 
 // JWT tokens from environment variables
@@ -30,28 +31,24 @@ const TENANTS = {
     name: "BasicCorp",
     tenantId: "t-cc327c5c",
     tier: "BASIC",
-    apiKey: __ENV.BASIC_API_KEY,
     jwtToken: BASIC_JWT,
   },
   STANDARD: {
     name: "TestStandardCorp",
     tenantId: "t-9a72f0b8",
     tier: "STANDARD",
-    apiKey: __ENV.STANDARD_API_KEY,
     jwtToken: STANDARD_JWT,
   },
   PREMIUM: {
     name: "PremiumCorp",
     tenantId: "t-46d6c4c8",
     tier: "PREMIUM",
-    apiKey: __ENV.PREMIUM_API_KEY,
     jwtToken: PREMIUM_JWT,
   },
   PLATINUM: {
     name: "qwerty Corp",
     tenantId: "t-cad5c200",
     tier: "PLATINUM",
-    apiKey: __ENV.PLATINUM_API_KEY,
     jwtToken: PLATINUM_JWT,
   },
 };
@@ -182,7 +179,6 @@ export const options = {
 // ==================== HELPER FUNCTIONS ====================
 function getHeaders(tenant) {
   return {
-    "x-api-key": tenant.apiKey,
     Authorization: `Bearer ${tenant.jwtToken}`,
     "Content-Type": "application/json",
   };

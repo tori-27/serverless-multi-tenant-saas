@@ -3,7 +3,6 @@ import {
   PutCommand,
   UpdateCommand,
   DeleteCommand,
-  ScanCommand,
   QueryCommand,
   DynamoDBDocumentClient,
 } from "@aws-sdk/lib-dynamodb";
@@ -32,21 +31,6 @@ export class BaseRepo<TItem extends Record<string, any>> {
       })
     );
     return res.Item ? this.fromItem(res.Item) : null;
-  }
-
-  /**
-   * Scan table (uses default client - typically for admin operations)
-   */
-  async scan(limit?: number, client?: DynamoDBDocumentClient) {
-    const ddb = client || ddbDocClient;
-    const res = await ddb.send(
-      new ScanCommand({
-        TableName: this.tableName,
-        Limit: limit,
-        ReturnConsumedCapacity: "TOTAL",
-      })
-    );
-    return (res.Items ?? []).map(this.fromItem);
   }
 
   /**
@@ -87,18 +71,28 @@ export class BaseRepo<TItem extends Record<string, any>> {
 
     if (sets.length === 0) return this.get(key, ddb);
 
-    const res = await ddb.send(
-      new UpdateCommand({
-        TableName: this.tableName,
-        Key: key,
-        UpdateExpression: `SET ${sets.join(", ")}`,
-        ExpressionAttributeNames: names,
-        ExpressionAttributeValues: values,
-        ReturnValues: "ALL_NEW",
-        ReturnConsumedCapacity: "TOTAL",
-      })
-    );
-    return res.Attributes ? this.fromItem(res.Attributes) : null;
+    // Only update existing items; without the condition UpdateItem would
+    // create a new item for an unknown key.
+    names["#pk_exists"] = Object.keys(key)[0];
+
+    try {
+      const res = await ddb.send(
+        new UpdateCommand({
+          TableName: this.tableName,
+          Key: key,
+          UpdateExpression: `SET ${sets.join(", ")}`,
+          ConditionExpression: "attribute_exists(#pk_exists)",
+          ExpressionAttributeNames: names,
+          ExpressionAttributeValues: values,
+          ReturnValues: "ALL_NEW",
+          ReturnConsumedCapacity: "TOTAL",
+        })
+      );
+      return res.Attributes ? this.fromItem(res.Attributes) : null;
+    } catch (e: any) {
+      if (e?.name === "ConditionalCheckFailedException") return null;
+      throw e;
+    }
   }
 
   /**
